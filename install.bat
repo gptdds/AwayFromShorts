@@ -29,8 +29,17 @@ copy /y "%SRC%src\register-task.ps1"    "%APP%\src\" >nul
 copy /y "%SRC%src\register-webui-task.ps1" "%APP%\src\" >nul
 copy /y "%SRC%src\close-browser-windows.ps1" "%APP%\src\" >nul
 copy /y "%SRC%src\close-browser.vbs"             "%APP%\src\" >nul
+copy /y "%SRC%src\token.ps1"                    "%APP%\src\" >nul
+copy /y "%SRC%src\push_gist.ps1"                "%APP%\src\" >nul
+copy /y "%SRC%src\hub_config.ps1"               "%APP%\src\" >nul
+copy /y "%SRC%src\push_phone_repo.ps1"          "%APP%\src\" >nul
+copy /y "%SRC%src\apply_checkins.py"            "%APP%\src\" >nul
+copy /y "%SRC%src\check_study.py"               "%APP%\src\" >nul
+copy /y "%SRC%src\study_sync.py"                "%APP%\src\" >nul
+copy /y "%SRC%src\sync_activity.py"             "%APP%\src\" >nul
 if not exist "%APP%\src\web" mkdir "%APP%\src\web"
 copy /y "%SRC%src\web\index.html"       "%APP%\src\web\" >nul
+copy /y "%SRC%src\web\study.html"       "%APP%\src\web\" >nul
 if not exist "%APP%\src\config.json" copy /y "%SRC%src\config.example.json" "%APP%\src\config.json" >nul
 copy /y "%SRC%uninstall.bat" "%APP%\" >nul
 copy /y "%SRC%start-web.bat" "%APP%\" >nul

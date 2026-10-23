@@ -36,6 +36,10 @@ $indexPath = Join-Path $PSScriptRoot 'web\index.html'
 if (-not (Test-Path $indexPath)) { throw "缺少前端页面: $indexPath" }
 $indexBytes = [System.IO.File]::ReadAllBytes($indexPath)
 
+# 学习台(本地库): 页面是原版 final.html, 数据落本机, 不再依赖资料库在线表
+$studyPagePath = Join-Path $PSScriptRoot 'web\study.html'
+$script:StudyDbPath = Join-Path $PSScriptRoot 'study-db.json'
+
 # ---------------- 基础 HTTP ---------------
 
 function Send-AfsResponse {
@@ -52,6 +56,47 @@ function Send-AfsJson {
     param($Stream, [int]$Status, $Obj)
     $json = ConvertTo-Json $Obj -Depth 12 -Compress
     Send-AfsResponse -Stream $Stream -Status $Status -Type 'application/json; charset=utf-8' -Body $json
+
+}
+# ---------------- 学习台: 本地库 ----------------
+# web/study.html 是从 WorkBuddy 资料库搬来的原版页面, 靠 window.__SMART_PAGE__ 垫片工作。
+# 垫片把 SDK 的 query/addRecord/updateRecord/deleteRecord 翻译成 /api/study/db/*,
+# 数据落在本机 study-db.json —— 不需要登录态, 也不再依赖云端在线表。
+$script:AFS_STUDY_TABLES = @('goals', 'logs', 'notes', 'focus')
+
+function Read-AfsStudyStore {
+    if (-not (Test-Path $script:StudyDbPath)) {
+        return @{ goals = @(); logs = @(); notes = @(); focus = @() }
+    }
+    $store = ConvertTo-AfsHashtable (ConvertFrom-Json (Read-AfsTextRetry -Path $script:StudyDbPath))
+    foreach ($k in $script:AFS_STUDY_TABLES) {
+        if (-not $store.ContainsKey($k) -or $null -eq $store[$k]) { $store[$k] = @() }
+        else { $store[$k] = @($store[$k]) }
+    }
+    $store
+}
+
+function Save-AfsStudyStore {
+    param($Store)
+    Write-AfsTextAtomic -Path $script:StudyDbPath -Text (ConvertTo-Json $Store -Depth 12)
+}
+
+# 页面写记录时字段带类型({ 总量: { number: 20 } }), 本地库只存裸值
+function Get-AfsStudyValue {
+    param($Prop)
+    if ($null -eq $Prop) { return $null }
+    if ($Prop -is [string] -or $Prop -is [int] -or $Prop -is [long] -or $Prop -is [double] -or $Prop -is [bool]) { return $Prop }
+    foreach ($k in @('text', 'number', 'date', 'checkbox', 'select', 'multiSelect')) {
+        $p = $Prop.PSObject.Properties[$k]
+        if ($null -ne $p) { return $p.Value }
+    }
+    $Prop
+}
+
+function Get-AfsStudyTable {
+    param([string]$Name)
+    if ($script:AFS_STUDY_TABLES -notcontains $Name) { throw "未知数据表: $Name" }
+    $Name
 }
 
 # ---------------- 状态 ----------------
@@ -186,21 +231,34 @@ $handler = {
                 # 强制模式开启期间:
                 #   「屏蔽星期 / 屏蔽时段」-> 硬拒 (它们正是"何时算非屏蔽时段"的定义, 改了就绕开强制)
                 #   「放宽」类(删屏蔽项 / 关屏蔽开关 / 往白名单加项) -> 生效时段内硬拒 (只能增不能删, 删了就是放行)
-                #   「收紧」类(加屏蔽项 / 开屏蔽开关 / 从白名单删项) -> 生效时段内先排队, 等本次时段结束由引擎自动生效
+                #   「收紧」类(加屏蔽项 / 开屏蔽开关 / 从白名单删项) -> 立即落地生效 (只收紧, 无放行风险),
+                #     合并进 config 后马上踢一次屏蔽引擎, 不再等本次时段结束。
                 #   判据集中在 core.ps1 的 Get-AfsConfigLockDiff (可离线回归测试)。
                 if ([bool]$curCfg.force.enabled) {
                     $diff = Get-AfsConfigLockDiff -Current $curCfg -Incoming $inCfg
                     if ($diff.hardMsg) { throw $diff.hardMsg }
                     if ($forceNow.active -and $diff.widenMsg) { throw $diff.widenMsg }
                     if (@($diff.queueKeys).Count -gt 0 -and $forceNow.active) {
-                        $q = Save-AfsPendingQueue -Current $curCfg -Incoming $inCfg -Reason '强制模式生效中'
+                        # 老版本排下的队列先一并落地, 再叠本次改动 (都只收紧, 无放行风险)
+                        try {
+                            Invoke-AfsPendingApply -Config $curCfg -IgnoreWindow | Out-Null
+                            $curCfg = Get-AfsConfig
+                        } catch { }
+                        $np = New-AfsPendingPatch -Current $curCfg -Incoming $inCfg
+                        if ([int]$np.total -gt 0) {
+                            $merged = Merge-AfsPendingTighten -Base $curCfg -Patch $np.patch
+                            $null = Set-AfsConfigSafe -InputConfig $merged
+                            Remove-AfsPendingQueue
+                        }
+                        # 不自动踢引擎(避免额外进程开销): 引擎常规 tick 自然带上新配置;
+                        # 急用走面板「⚡ 立即应用」人工触发 (/api/apply)。
                         Send-AfsJson -Stream $stream -Status 200 -Obj @{
                             ok          = $true
-                            queued      = $true
-                            note        = '已排队: 将在本次屏蔽时段结束后自动生效'
-                            config      = $curCfg
+                            queued      = $false
+                            note        = '已保存: 收紧改动已写入配置, 引擎下一轮自动应用; 急用点「立即应用」'
+                            config      = (Get-AfsConfig)
                             forceActive = $true
-                            pending     = $q
+                            pending     = $null
                         }
                         return
                     }
@@ -274,12 +332,16 @@ $handler = {
         }
         if ($method -eq 'POST' -and $path -eq '/api/apply') {
             try {
+                # 先把历史遗留的排队内容落地(补丁只收紧, 任何时刻落地都无放行风险),
+                # 再跑本次强制 —— 保证「立即应用」点下去, 面板上能看到的所有收紧改动全部生效。
+                $flushErr = $null
+                try { Invoke-AfsPendingApply -IgnoreWindow | Out-Null } catch { $flushErr = $_.Exception.Message }
                 $cfgNow = Get-AfsConfig
                 if (Get-AfsIsAdmin) {
                     $res = Invoke-AfsLocked -Action {
                         Invoke-AfsEnforce -Config $cfgNow -HostsPath (Get-AfsDefaultHostsPath) -LogPath $logPath
                     }
-                    Send-AfsJson -Stream $stream -Status 200 -Obj @{ ok = $true; applied = $true; result = $res }
+                    Send-AfsJson -Stream $stream -Status 200 -Obj @{ ok = $true; applied = $true; result = $res; flushError = $flushErr }
                 } else {
                     Send-AfsJson -Stream $stream -Status 200 -Obj @{ ok = $true; applied = $false; note = '面板非管理员权限, 已交由计划任务执行(1 分钟内)' }
                 }
@@ -322,6 +384,76 @@ $handler = {
                 Send-AfsJson -Stream $stream -Status 200 -Obj @{ ok = $true; until = $c.override.until; applied = $applied; note = $note }
             } catch {
                 Send-AfsJson -Stream $stream -Status 400 -Obj @{ ok = $false; error = $_.Exception.Message }
+            }
+            return
+        }
+        if ($method -eq 'GET' -and $path -eq '/api/study') {
+            # 学习联动状态: 开关/区间 + 今天目标进度 + 当前是否因学习被继续屏蔽
+            try {
+                $cfgS  = Get-AfsConfig
+                $infoS = Get-AfsStudyInfo
+                $stS   = Get-AfsActiveState -Config $cfgS
+                $pend  = @()
+                if ($infoS.ok) { $pend = @($infoS.pendingNames) }
+                # 手机端的数据靠 push_gist.ps1 推; 连续推不上去时面板要亮角标,
+                # 否则"手机上还锁着/已经不锁了"这类问题只能翻日志才发现。
+                $gistS = @{ fails = 0; lastOk = ''; lastFail = ''; error = '' }
+                try {
+                    $gp = Join-Path (Split-Path (Get-AfsConfigPath)) 'study-gist-state.json'
+                    if (Test-Path $gp) {
+                        $gj = ConvertFrom-Json ([System.IO.File]::ReadAllText($gp, [System.Text.Encoding]::UTF8))
+                        $gistS = @{ fails    = [int]$gj.fails
+                                    lastOk   = [string]$gj.lastOk
+                                    lastFail = [string]$gj.lastFail
+                                    error    = [string]$gj.error }
+                    }
+                } catch { }
+                Send-AfsJson -Stream $stream -Status 200 -Obj @{
+                    ok        = $true
+                    studyHold = $cfgS.studyHold
+                    flag      = $infoS
+                    active    = $stS.active
+                    reason    = $stS.reason
+                    pending   = $pend
+                    gist      = $gistS
+                }
+            } catch {
+                Send-AfsJson -Stream $stream -Status 500 -Obj @{ ok = $false; error = $_.Exception.Message }
+            }
+            return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/study/hold') {
+            try {
+                $b = $body | ConvertFrom-Json -ErrorAction Stop
+                # 只有开关, 没有时间窗(老的 start/end 字段来了也直接忽略)
+                $c = Get-AfsConfig
+                # 防绕过: PC 正在屏蔽中就不许关学习联动 —— 目标没打完时打开面板
+                # 把开关一关, 延长屏蔽立刻失效。
+                # force 长期开着的话这一条等于把开关焊死, 关它得先过 force 这关。
+                if (-not [bool]$b.enabled) {
+                    $stH = Get-AfsActiveState -Config $c
+                    if ($stH.active) {
+                        throw ("PC 正在屏蔽时间内（" + $stH.reason + "），学习联动开关不能关闭")
+                    }
+                }
+                $c.studyHold = @{ enabled = [bool]$b.enabled }
+                Set-AfsConfigSafe -InputConfig $c | Out-Null
+                Send-AfsJson -Stream $stream -Status 200 -Obj @{
+                    ok = $true; studyHold = (Get-AfsConfig).studyHold
+                    note = '已保存, 1 分钟内生效'
+                }
+            } catch {
+                Send-AfsJson -Stream $stream -Status 400 -Obj @{ ok = $false; error = $_.Exception.Message }
+            }
+            return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/study/check') {
+            try {
+                $run = Invoke-AfsStudySync -Wait
+                $infoS = Get-AfsStudyInfo
+                Send-AfsJson -Stream $stream -Status 200 -Obj @{ ok = $true; flag = $infoS; run = $run }
+            } catch {
+                Send-AfsJson -Stream $stream -Status 500 -Obj @{ ok = $false; error = $_.Exception.Message }
             }
             return
         }
@@ -446,6 +578,95 @@ $handler = {
             $script:AFS_STOP = $true
             return
         }
+        # ---------- 学习台: 本地库 ----------
+        if ($method -eq 'GET' -and ($path -eq '/study' -or $path -eq '/study.html')) {
+            if (-not (Test-Path $studyPagePath)) {
+                Send-AfsResponse -Stream $stream -Status 404 -Type 'text/plain; charset=utf-8' -Body 'study page missing'
+                return
+            }
+            Send-AfsResponse -Stream $stream -Status 200 -Type 'text/html; charset=utf-8' -Body ([System.IO.File]::ReadAllBytes($studyPagePath))
+            return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/study/db/query') {
+            try {
+                $q = $body | ConvertFrom-Json -ErrorAction Stop
+                $table = Get-AfsStudyTable ([string]$q.table)
+                $store = Read-AfsStudyStore
+                $rows = @($store[$table])
+                if ($table -eq 'focus') {
+                    # 专注记录由 sync_activity.py 每 15 分钟从 activity.json 生成，本地优先
+                    $fp = Join-Path ([System.IO.Path]::GetDirectoryName($script:StudyDbPath)) 'focus-local.json'
+                    if (Test-Path $fp) {
+                        try {
+                            # ConvertTo-AfsHashtable 用 `,$arr` 返回防展开, 必须先赋值再 @()
+                            $tmpRows = ConvertTo-AfsHashtable (ConvertFrom-Json (Read-AfsTextRetry -Path $fp))
+                            $rows = @($tmpRows)
+                        } catch { }
+                    }
+                }
+                $sorts = @($q.sorts)
+                if ($sorts.Count -gt 0 -and $sorts[0] -and $sorts[0].property) {
+                    $prop = [string]$sorts[0].property
+                    $desc = ([string]$sorts[0].direction) -ne 'ascending'
+                    $rows = @($rows | Sort-Object -Property @{ Expression = { [string]$_[$prop] } } -Descending:$desc)
+                }
+                Send-AfsJson -Stream $stream -Status 200 -Obj @{ ok = $true; table = $table; results = $rows; hasMore = $false; nextCursor = '' }
+            } catch {
+                Send-AfsJson -Stream $stream -Status 400 -Obj @{ ok = $false; error = $_.Exception.Message }
+            }
+            return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/study/db/add') {
+            try {
+                $o = $body | ConvertFrom-Json -ErrorAction Stop
+                $table = Get-AfsStudyTable ([string]$o.table)
+                $store = Read-AfsStudyStore
+                $rec = @{ id = ('L' + [guid]::NewGuid().ToString('N').Substring(0, 18)) }
+                foreach ($p in $o.properties.PSObject.Properties) { $rec[$p.Name] = Get-AfsStudyValue $p.Value }
+                $store[$table] = @(@($store[$table]) + @($rec))
+                Save-AfsStudyStore $store
+                Send-AfsJson -Stream $stream -Status 200 -Obj @{ ok = $true; record = $rec }
+            } catch {
+                Send-AfsJson -Stream $stream -Status 400 -Obj @{ ok = $false; error = $_.Exception.Message }
+            }
+            return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/study/db/update') {
+            try {
+                $o = $body | ConvertFrom-Json -ErrorAction Stop
+                $table = Get-AfsStudyTable ([string]$o.table)
+                $store = Read-AfsStudyStore
+                $rows = @($store[$table])
+                $hit = -1
+                for ($i = 0; $i -lt $rows.Count; $i++) {
+                    if ([string]$rows[$i]['id'] -eq [string]$o.recordId) { $hit = $i; break }
+                }
+                if ($hit -lt 0) { throw "记录不存在: $($o.recordId)" }
+                $rec = $rows[$hit]
+                foreach ($p in $o.properties.PSObject.Properties) { $rec[$p.Name] = Get-AfsStudyValue $p.Value }
+                $rows[$hit] = $rec
+                $store[$table] = $rows
+                Save-AfsStudyStore $store
+                Send-AfsJson -Stream $stream -Status 200 -Obj @{ ok = $true; record = $rec }
+            } catch {
+                Send-AfsJson -Stream $stream -Status 400 -Obj @{ ok = $false; error = $_.Exception.Message }
+            }
+            return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/study/db/delete') {
+            try {
+                $o = $body | ConvertFrom-Json -ErrorAction Stop
+                $table = Get-AfsStudyTable ([string]$o.table)
+                $store = Read-AfsStudyStore
+                $before = @($store[$table]).Count
+                $store[$table] = @($store[$table] | Where-Object { [string]$_['id'] -ne [string]$o.recordId })
+                Save-AfsStudyStore $store
+                Send-AfsJson -Stream $stream -Status 200 -Obj @{ ok = $true; removed = ($before - @($store[$table]).Count) }
+            } catch {
+                Send-AfsJson -Stream $stream -Status 400 -Obj @{ ok = $false; error = $_.Exception.Message }
+            }
+            return
+        }
         Send-AfsResponse -Stream $stream -Status 404 -Type 'text/plain; charset=utf-8' -Body '404 not found'
     } catch {
         try { Send-AfsResponse -Stream $stream -Status 500 -Type 'text/plain; charset=utf-8' -Body ("server error: " + $_.Exception.Message) } catch { }
@@ -469,6 +690,7 @@ try {
 Write-Output "AwayFromShorts 配置面板已启动: http://127.0.0.1:$Port/  (Ctrl+C 停止)"
 
 $script:AFS_LAST_SAMPLE = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+$script:AFS_LAST_STUDY  = 0    # 0 = 启动后第一轮空闲就同步一次
 while (-not $script:AFS_STOP) {
     $pending = $false
     try { $pending = $listener.Pending() } catch { }
@@ -487,6 +709,12 @@ while (-not $script:AFS_STOP) {
         if (($nowSec - $script:AFS_LAST_SAMPLE) -ge 60) {
             $script:AFS_LAST_SAMPLE = $nowSec
             try { Invoke-AfsActivitySample } catch { }
+        }
+        # 学习联动: 每 15 分钟把使用统计同步到云端 + 刷新今日打卡进度(study.flag)。
+        # 独立进程跑, 不阻塞面板响应; 失败只影响数据新鲜度, 不影响屏蔽。
+        if (($nowSec - $script:AFS_LAST_STUDY) -ge 900) {
+            $script:AFS_LAST_STUDY = $nowSec
+            try { Invoke-AfsStudySync | Out-Null } catch { }
         }
     }
 }

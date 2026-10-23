@@ -19,3 +19,17 @@ Thumbs.db
 
 # 个人清单,不进仓库
 reset-apps.txt
+
+# 学习台/同步的运行时数据(本机状态, 不进仓库)
+study-db.json
+focus-local.json
+study.flag
+sync-state.json
+github-token.enc
+study-gist-state.json
+hub-state.json
+checkin-queue*.json
+phone-activity.cache.json
+browser-*.json
+browser-*.heartbeat
+*.bak-*

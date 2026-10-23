@@ -61,11 +61,14 @@ function Invoke-AfsCloseRound {
         seen     = @()
         matched  = @()
         closed   = @()
-        reopened = $false
+        reopened = 0
         error    = ''
     }
+    $restartAll = $false
     try {
-        if (-not (Test-Path $payloadPath)) { return }
+        if (-not (Test-Path $payloadPath)) {
+            return @{ closed = 0; reopened = 0; restartAll = $false; empty = $true }
+        }
         $p = ConvertFrom-Json ([System.IO.File]::ReadAllText($payloadPath, [System.Text.Encoding]::UTF8))
         $patterns   = @($p.patterns)
         $targets    = @($p.targets)
@@ -111,6 +114,7 @@ function Invoke-AfsCloseRound {
             }
         }
 
+        $closedBy = @{}    # 浏览器名 -> 关掉的窗口数(重开时按这个数恢复)
         foreach ($pidKey in $candidates.Keys) {
             $title = [string]$candidates[$pidKey]
             $wn = $pidName[[int]$pidKey]
@@ -127,19 +131,40 @@ function Invoke-AfsCloseRound {
                     Start-Sleep -Milliseconds 400
                     if (-not (Get-Process -Id ([int]$pidKey) -ErrorAction SilentlyContinue)) {
                         $log.closed += "$wn($pidKey) [$title] (强制)"
+                        $closedBy[$wn] = [int]$closedBy[$wn] + 1
                     }
                 } catch { }
             }
         }
 
         if ($restartAll) {
+            # ★ 这里是「一次性重启」：串行做三件事，顺序不能换。
+            #   1) 先删 payload —— 计划任务每分钟都会拉新实例，留着它下一个实例会再杀一遍，
+            #      外面看到的就是"浏览器被开关好几次"。
+            #   2) 记时间戳 —— core.ps1 读它做去抖，8 分钟内不再重启第二次。
+            #   3) 按被关掉的窗口数恢复 —— 原来固定只开一个空白窗口，三个窗口的用户回来只剩一个。
+            $want = @($log.closed).Count
+            try { if (Test-Path $payloadPath) { Remove-Item $payloadPath -Force -ErrorAction SilentlyContinue } } catch { }
+            try { if (Test-Path (Join-Path $dir 'browser-restart.pending.json')) { Remove-Item (Join-Path $dir 'browser-restart.pending.json') -Force -ErrorAction SilentlyContinue } } catch { }
+            try {
+                $rs = @{ lastRestart = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); closed = $want }
+                [System.IO.File]::WriteAllText((Join-Path $dir 'browser-restart.json'),
+                    (ConvertTo-Json $rs), (New-Object System.Text.UTF8Encoding($false)))
+            } catch { }
             Start-Sleep -Seconds 2
-            foreach ($n in $hadWindow) {
-                $any = @(Get-Process -Name $n -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle })
-                if (-not $any) {
-                    try { Start-Process -FilePath $n -ArgumentList '--new-window'; $log.reopened = $true } catch { }
+            $opened = 0
+            foreach ($nm in @($closedBy.Keys)) {
+                # 等这 2 秒的意义：浏览器可能已经自己把上次会话恢复了，那就只补差额，
+                # 否则「恢复会话」+「按数补窗」= 两倍窗口。
+                $now = @(Get-Process -Name $nm -ErrorAction SilentlyContinue |
+                    Where-Object { $_.MainWindowTitle }).Count
+                $need = [int]$closedBy[$nm] - $now
+                if ($need -gt 8) { $need = 8 }     # 上限：一次开二十个窗口等于把桌面炸了
+                for ($i = 0; $i -lt $need; $i++) {
+                    try { Start-Process -FilePath $nm -ArgumentList '--new-window'; $opened++ } catch { }
                 }
             }
+            $log.reopened = $opened
         }
     } catch {
         $log.error = $_.Exception.Message
@@ -147,7 +172,7 @@ function Invoke-AfsCloseRound {
     try {
         [System.IO.File]::WriteAllText($logPath, (ConvertTo-Json $log), (New-Object System.Text.UTF8Encoding($false)))
     } catch { }
-    return @($log.closed).Count
+    return @{ closed = @($log.closed).Count; reopened = [int]$log.reopened; restartAll = [bool]$restartAll }
 }
 
 # 屏蔽期间常驻监测, 固定短轮询:
@@ -159,14 +184,17 @@ $heartbeatPath = Join-Path $dir 'browser-close.heartbeat'
 $emptyRounds = 0
 while ($true) {
     # 全局兜底: 单轮任何未捕获异常都不中断常驻循环, 避免"进程静默死亡导致屏蔽失效"
+    $round = $null
     try {
-        $null = Invoke-AfsCloseRound
+        $round = Invoke-AfsCloseRound
     } catch {
         try {
             $hb = @{ time = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); error = $_.Exception.Message }
             [System.IO.File]::WriteAllText($heartbeatPath, (ConvertTo-Json $hb), (New-Object System.Text.UTF8Encoding($false)))
         } catch { }
     }
+    # restartAll 是一次性动作：这一轮开完窗口就结束，绝不再循环一轮把它关掉。
+    if ($round -and $round.restartAll) { break }
     $stillActive = $false
     if (Test-Path $payloadPath) {
         try {

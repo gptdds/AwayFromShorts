@@ -51,6 +51,13 @@ function Get-AfsDefaultConfig {
         force = @{ enabled = $false; until = $null; weekdays = @() }   # 强制模式: 所选星期内强制, 强制中不可关闭(防破戒)
         web = @{ port = 8737 }
 
+        # 学习联动: 过了今天的屏蔽时段, 若学习台里今天的目标还没全部打卡, 就一直屏蔽到打完。
+        # 只有开关、没有时间窗 —— 和手机端同口径(目标没打完 = 直接延长冻结, 打完立即放行)。
+        # study.flag 由学习台侧脚本(check_study.py)写入; 读不到/过期一律放行, 不会锁死。
+        studyHold = @{
+            enabled = $false
+        }
+
         browser = @{
             enabled  = $true    # 屏蔽时优雅关闭标题匹配的浏览器窗口(工作区), 其他窗口不受影响
             windows  = @()      # 窗口标题列表(支持 * 通配符), 例如 '娱乐'
@@ -283,8 +290,8 @@ function Get-AfsListRemoved {
 # 强制模式开启期间, 把配置改动分成三类 (防破戒):
 #   硬拒 hard  : 屏蔽星期 / 屏蔽时段 —— "什么时候算非屏蔽时段"正是由它们定义, 参与排队会让排队规则自己失效
 #   放宽 widen : 删掉屏蔽项 / 关掉屏蔽开关 / 往白名单里加项 —— 都是"直接放行", 生效时段内一律拒绝 (只能收紧, 不能放宽)
-#   可排队 queue: 新增屏蔽项 / 打开屏蔽开关 / 从白名单删项 —— 方向是"更严", 生效时段内先存队列,
-#                等本次屏蔽时段结束再自动应用; 既不影响当前这一轮强制, 用户也不用干等
+#   可排队 queue: 新增屏蔽项 / 打开屏蔽开关 / 从白名单删项 —— 方向是"更严", 生效时段内保存时立即写入 config
+#                (只收紧无放行风险, 引擎常规 tick 自动应用; 急用走面板「立即应用」人工触发)
 # 返回 @{ any; hardKeys; hardMsg; widenKeys; widenLabels; widenMsg; queueKeys; queueLabels; queueMsg }
 # 抽成独立函数是为了能脱离 HTTP 服务做离线回归测试。
 function Get-AfsConfigLockDiff {
@@ -464,10 +471,10 @@ function Test-AfsConfigLockViolation {
     $null
 }
 
-# ---------- 待生效队列 (排队) ----------
-# 强制模式生效时段内, 屏蔽名单类改动不再直接丢给用户一句"关掉强制模式再来",
-# 而是先落到 pending-config.json, 等本次屏蔽时段结束(即进入非屏蔽时段)由引擎自动合并进 config.json。
-# 这样既不影响当前这一轮强制, 也不用用户为了加一个域名就得先把强制模式关掉。
+# ---------- 待生效队列 (兼容保留) ----------
+# 旧版: 强制模式生效时段内, 屏蔽名单类改动先落到 pending-config.json, 等本次屏蔽时段结束由引擎合并。
+# 现在: 收紧类改动保存时立即落地(webui.ps1 直接 Merge-AfsPendingTighten 写 config)。
+# 队列文件机制保留, 仅用于兼容清理历史遗留的 pending-config.json。
 
 function Get-AfsPendingPath {
     (Join-Path (Split-Path (Get-AfsConfigPath)) 'pending-config.json')
@@ -705,6 +712,13 @@ $null = $cfg.Remove('clash')   # Clash 接管功能已移除 (v1.2.7): 清理旧
     try { $cfg.web.port = [int]$cfg.web.port } catch { $cfg.web.port = 8737 }
     if ($cfg.web.port -lt 1 -or $cfg.web.port -gt 65535) { $cfg.web.port = 8737 }
 
+    # 学习联动: 只有开关。老 config.json 里残留的 start/end 一律忽略(不再参与判定、也不再下发)
+    if ($cfg.studyHold) {
+        $sh = $cfg.studyHold
+        $sh.enabled = [bool]$sh.enabled
+        $cfg.studyHold = $sh
+    }
+
     $cfg.browser.enabled  = [bool]$cfg.browser.enabled
     $cfg.browser.urlBlock = [bool]$cfg.browser.urlBlock
     $cfg.browser.windows = @(Normalize-AfsList $cfg.browser.windows | ForEach-Object { ([string]$_).Trim() } |
@@ -714,6 +728,28 @@ $null = $cfg.Remove('clash')   # Clash 接管功能已移除 (v1.2.7): 清理旧
     if ($cfg.browser.targets.Count -eq 0) { $cfg.browser.targets = @('edge','chrome') }
 
     Write-AfsJson -Path (Get-AfsConfigPath) -Object $cfg
+
+    # ★ hub 配置推送钩子（Gist 中心仓库）：配置一落盘就把 PC 分节推上去。
+    #   fire-and-forget：隐藏进程跑 hub_config.ps1 -PushOnly，内部有 120 秒节流，
+    #   引擎每分钟的自动写盘（宽限结束、force 修复等）不会真的每分钟都推。
+    #   推送失败只留日志，绝不影响屏蔽主流程。
+    try {
+        $hubState = Join-Path (Split-Path (Get-AfsConfigPath)) 'hub-state.json'
+        $stale = $true
+        if (Test-Path $hubState) {
+            $hs = ConvertFrom-Json ([System.IO.File]::ReadAllText($hubState, [System.Text.Encoding]::UTF8))
+            $lp = $null
+            if ($hs.lastPush -and [datetime]::TryParse([string]$hs.lastPush, [ref]$lp)) {
+                $stale = ((Get-Date) - $lp).TotalSeconds -ge 120
+            }
+        }
+        if ($stale) {
+            Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                (Join-Path $PSScriptRoot 'hub_config.ps1'), '-PushOnly')
+        }
+    } catch { }
+
     $cfg
 }
 
@@ -838,6 +874,100 @@ function Test-AfsInWindow {
 }
 
 # 当前时间是否落在屏蔽计划窗口内 (schedule.days + windows, 支持跨午夜)
+# ---------- 学习联动 (读学习台写下的 study.flag) ----------
+# 学习台把"今天的目标是否全部打卡"写到 study.flag; 引擎在这里读。
+# 宁可放行也不锁死: 文件不存在 / JSON 坏 / 不是今天的 / 超过 45 分钟没更新 -> 一律视为"已完成"。
+
+$script:AFS_STUDY_FLAG      = 'study.flag'
+$script:AFS_STUDY_STALE_MIN = 45
+
+function Get-AfsStudyFlagPath { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_STUDY_FLAG) }
+
+function Get-AfsStudyInfo {
+    <# ok=$false 表示"读不到可信进度"; 其余字段来自 study.flag #>
+    $p = Get-AfsStudyFlagPath
+    if (-not (Test-Path $p)) { return @{ ok = $false; reason = 'flag-missing' } }
+    try {
+        $j = ConvertFrom-Json ([System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8))
+    } catch { return @{ ok = $false; reason = 'flag-bad-json' } }
+    if (-not $j) { return @{ ok = $false; reason = 'flag-empty' } }
+    if (($j.PSObject.Properties.Name -contains 'error') -and $j.error) {
+        return @{ ok = $false; reason = 'flag-error' }
+    }
+    if ([string]$j.date -ne (Get-Date).ToString('yyyy-MM-dd')) {
+        return @{ ok = $false; reason = 'flag-outdated' }
+    }
+    if (((Get-Date) - (Get-Item $p).LastWriteTime).TotalMinutes -gt $script:AFS_STUDY_STALE_MIN) {
+        return @{ ok = $false; reason = 'flag-stale' }
+    }
+    @{
+        ok           = $true
+        allDone      = [bool]$j.allDone
+        pending      = [int]$j.pending
+        pendingNames = @($j.pendingNames)
+        activeCount  = [int]$j.active
+        date         = [string]$j.date
+        checkedAt    = [string]$j.checkedAt
+    }
+}
+
+# 只在"读到了可信进度且确实没打完"时返回 $false
+function Test-AfsStudyDone {
+    $s = Get-AfsStudyInfo
+    if (-not $s.ok) { return $true }
+    [bool]$s.allDone
+}
+
+# 找 Python: 优先 WorkBuddy 内置解释器, 再退回系统安装
+function Get-AfsPythonPath {
+    $cands = @()
+    $root = Join-Path $env:USERPROFILE '.workbuddy\binaries\python\versions'
+    if (Test-Path $root) {
+        $cands += @(Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName 'python.exe' })
+    }
+    $cands += @('C:\Python313\python.exe', 'C:\Python312\python.exe', 'C:\Python311\python.exe')
+    $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($cmd) { $cands += $cmd.Source }
+    foreach ($c in $cands) { if ($c -and (Test-Path $c)) { return $c } }
+    $null
+}
+
+# 跑一次"使用统计上云 + 今日打卡进度"。$Wait=$true 时等它跑完并回传输出。
+# 面板每 15 分钟调用一次; 失败只影响数据新鲜度, 不影响屏蔽本身。
+# 注意: 不能用 Start-Process —— 它重建环境变量字典时, 若 PATH 里同时存在
+# HTTPS_PROXY / https_proxy 这类大小写重名变量会直接抛"已添加项", 进程根本起不来。
+function Invoke-AfsStudySync {
+    param([switch]$Wait)
+    $py = Get-AfsPythonPath
+    if (-not $py) { return @{ ok = $false; error = '找不到 python.exe' } }
+    $runner = Join-Path (Split-Path (Get-AfsConfigPath)) 'study_sync.py'
+    if (-not (Test-Path $runner)) { return @{ ok = $false; error = '找不到 study_sync.py' } }
+
+    if ($Wait) {
+        try {
+            $r = & $py $runner 2>&1
+            $lines = @($r | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
+            return @{ ok = $true; output = @($lines | Select-Object -Last 4) }
+        } catch {
+            return @{ ok = $false; error = $_.Exception.Message }
+        }
+    }
+
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $py
+        $psi.Arguments = '"' + $runner + '"'
+        $psi.UseShellExecute = $false     # 继承当前环境, 不重建字典(避开重名变量崩溃)
+        $psi.CreateNoWindow = $true
+        [void][System.Diagnostics.Process]::Start($psi)
+        return @{ ok = $true; started = $true }
+    } catch {
+        return @{ ok = $false; error = $_.Exception.Message }
+    }
+}
+
 function Test-AfsInScheduleWindow {
     param($Config, [datetime]$Now = (Get-Date))
     $dayNum = [int]$Now.DayOfWeek      # 0=周日
@@ -853,7 +983,9 @@ function Test-AfsInScheduleWindow {
 function Get-AfsActiveState {
     param($Config, [datetime]$Now = (Get-Date))
     # 强制模式最高优先级: 生效期间无论如何都屏蔽 (压过 enabled/override/schedule)
-    $force = Test-AfsForceActive -Config $Config
+    # ★ -Now 必须传下去: 不传的话 force 永远按真实时钟算,
+    #   "推演某个时刻"(面板算下次屏蔽时间 / 复盘日志)得到的就是错误状态
+    $force = Test-AfsForceActive -Config $Config -Now $Now
     if ($force.active) { return @{ active = $true; reason = 'force' } }
 
     if (-not $Config.enabled) { return @{ active = $false; reason = 'disabled' } }
@@ -878,6 +1010,13 @@ function Get-AfsActiveState {
         if (Test-AfsInWindow -Start $w.start -End $w.end -NowMin $nowMin) {
             return @{ active = $true; reason = 'schedule' }
         }
+    }
+    # 已到解锁时段。学习联动: 今天目标还没全部打卡 -> 继续屏蔽, 不再挑时间段。
+    # 以前这里还要求"当前时刻落在 studyHold.start-end 之内", 结果是区间之外照样放行,
+    # 闸门等于漏的(放行时段没和那个区间重合的应用根本拦不住)。现在只看打完没有。
+    $hold = $Config.studyHold
+    if ($hold -and [bool]$hold.enabled) {
+        if (-not (Test-AfsStudyDone)) { return @{ active = $true; reason = 'study-hold' } }
     }
     @{ active = $false; reason = 'time' }
 }
@@ -1208,9 +1347,62 @@ function Invoke-AfsActivitySample {
 $script:AFS_BROWSER_TASK  = 'AwayFromShorts-BrowserClose'
 $script:AFS_BROWSER_CLOSE = 'browser-close.json'
 $script:AFS_BROWSER_STATE = 'browser-state.json'
+$script:AFS_BROWSER_RESTART = 'browser-restart.json'
+# 去抖窗口：策略一改就重启浏览器，短时间内来回改会把窗口全打散。
+# 8 分钟内的第二次重启直接跳过 —— 浏览器下次启动自然会读到新策略。
+$script:AFS_RESTART_GAP_MIN = 8
+$script:AFS_BROWSER_RESTART_PENDING = 'browser-restart.pending.json'
 
 function Get-AfsBrowserClosePath  { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_BROWSER_CLOSE) }
 function Get-AfsBrowserStatePath { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_BROWSER_STATE) }
+function Get-AfsBrowserRestartPath { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_BROWSER_RESTART) }
+function Get-AfsBrowserPendingPath { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_BROWSER_RESTART_PENDING) }
+
+# 去抖窗口内被挡掉的那次重启不是"取消"，是"欠着"：记一个标记，等窗口过去再补。
+# 不补的话，屏蔽重新开启时浏览器还在用旧策略 —— 对自律工具来说等于放行，不能接受。
+function Set-AfsBrowserRestartPending {
+    try {
+        $o = @{ since = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') }
+        [System.IO.File]::WriteAllText((Get-AfsBrowserPendingPath), (ConvertTo-Json $o),
+            (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+
+function Clear-AfsBrowserRestartPending {
+    # 删不掉也不能把调用方打断：残留一个 pending 最坏是 8 分钟后再重启一次，
+    # 而抛异常会让"已排上队"被误判成"没排上"，下一分钟又排一遍。
+    try {
+        $p = Get-AfsBrowserPendingPath
+        if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+    } catch { }
+}
+
+# 引擎每分钟调一次：欠着的重启到点就补队列（最多晚 1 分钟）
+function Invoke-AfsBrowserPendingRestart {
+    param($Config)
+    try {
+        if (-not (Test-Path (Get-AfsBrowserPendingPath))) { return $false }
+        if (-not (Test-AfsBrowserRestartAllowed)) { return $false }
+        [void](Invoke-AfsBrowserWindowClose -Config $Config -RestartAll)
+        return $true
+    } catch { return $false }
+}
+
+# 上次真正重启的时间由 close-browser-windows.ps1 在重开窗口前写入。
+# 读不到/解析失败一律当作"可以重启"（宁可重启一次，也别让策略永远不生效）。
+function Test-AfsBrowserRestartAllowed {
+    param([int]$MinGapMin = $script:AFS_RESTART_GAP_MIN)
+    $p = Get-AfsBrowserRestartPath
+    if (-not (Test-Path $p)) { return $true }
+    try {
+        $o = ConvertFrom-Json ([System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8))
+        $t = [datetime]::MinValue
+        if ([datetime]::TryParse([string]$o.lastRestart, [ref]$t)) {
+            return (((Get-Date) - $t).TotalMinutes -ge $MinGapMin)
+        }
+    } catch { }
+    $true
+}
 
 function Read-AfsBrowserState {
     $p = Get-AfsBrowserStatePath
@@ -1331,6 +1523,12 @@ function Remove-AfsBrowserPolicy {
 # RestartAll: 关闭所有浏览器窗口后重新打开 (URLBlocklist 变更后重启使策略生效)
 function Invoke-AfsBrowserWindowClose {
     param($Config, [switch]$RestartAll)
+    # 去抖：只有「重启浏览器」这个动作需要，按标题关窗口(每分钟)不受影响。
+    # 返回 $false 表示这次没排重启，调用方会把原因写进日志。
+    if ($RestartAll -and -not (Test-AfsBrowserRestartAllowed)) {
+        Set-AfsBrowserRestartPending
+        return $false
+    }
     # 只按用户配置的窗口标题(工作区名, 如"娱乐")关闭窗口 —— 刻意不做"标题含屏蔽站点名"兜底:
     # 那会把普通工作窗口(如在工作区看 B 站教程/知乎)一并误关; 导航层拦截由 urlBlock 负责。
     $payload = @{
@@ -1339,6 +1537,9 @@ function Invoke-AfsBrowserWindowClose {
         restartAll = [bool]$RestartAll
     }
     Write-AfsJson -Path (Get-AfsBrowserClosePath) -Object $payload
+    # payload 落盘 = 已经排上队（任务自己每分钟也会触发一次），欠账到此结清。
+    # 不能等 schtasks /Run 成功才清：Run 失败不代表排不上队，清了才不会每分钟重排。
+    if ($RestartAll) { Clear-AfsBrowserRestartPending }
     # 用 wscript.exe + VBS 隐藏启动 (GUI 子系统, 无控制台窗口) —— 直接跑 powershell 即使 -WindowStyle Hidden
     # 控制台分配瞬间仍会闪黑窗, 这是"每分钟闪弹窗"的根因
     $vbsPath = Join-Path (Split-Path (Get-AfsConfigPath)) 'close-browser.vbs'
@@ -1395,14 +1596,16 @@ function Invoke-AfsBrowserWindowClose {
     [System.IO.File]::WriteAllText($xmlPath, $xml, [System.Text.Encoding]::Unicode)
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    & schtasks /Create /F /TN $script:AFS_BROWSER_TASK /XML $xmlPath *> $null
+    try { & schtasks /Create /F /TN $script:AFS_BROWSER_TASK /XML $xmlPath *> $null } catch { }
     Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
     $ErrorActionPreference = $prev
     }
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    & schtasks /Run /TN $script:AFS_BROWSER_TASK *> $null
+    # schtasks 被安全策略拦时是终止性错误：吞掉它，payload 已经写好，任务下一分钟自己会跑
+    try { & schtasks /Run /TN $script:AFS_BROWSER_TASK *> $null } catch { }
     $ErrorActionPreference = $prev
+    return $true
 }
 
 function Remove-AfsBrowserClose {
@@ -1454,6 +1657,8 @@ function Invoke-AfsEnforce {
         browser = 'off'
     }
     try {
+        # 上一轮被去抖挡掉的重启，到点补上（最多晚 1 分钟）
+        if (-not $Simulate) { [void](Invoke-AfsBrowserPendingRestart -Config $Config) }
         if ($active) {
             if ($Config.blockWebsites) {
                 # hosts 只能表达"域名级"拦截。为支持"整站屏蔽 + 路径放行", 这里做区分:
@@ -1524,7 +1729,7 @@ function Invoke-AfsEnforce {
                         $n = Set-AfsBrowserPolicy -Config $Config
                         Save-AfsBrowserState -Applied $true -Signature $curSig
                         $log.browser = "url-block($n domains)"
-                        Invoke-AfsBrowserWindowClose -Config $Config -RestartAll
+                        if (-not (Invoke-AfsBrowserWindowClose -Config $Config -RestartAll)) { $log.browser += ", restart-debounced" }
                     }
                 }
             } elseif ($bState.applied) {
@@ -1533,7 +1738,7 @@ function Invoke-AfsEnforce {
                     Remove-AfsBrowserPolicy -Config $Config
                     Save-AfsBrowserState -Applied $false
                     $log.browser = 'url-clean'
-                    Invoke-AfsBrowserWindowClose -Config $Config -RestartAll
+                    if (-not (Invoke-AfsBrowserWindowClose -Config $Config -RestartAll)) { $log.browser += ', restart-debounced' }
                 }
             }
         } else {
@@ -1552,7 +1757,7 @@ function Invoke-AfsEnforce {
                     Remove-AfsBrowserPolicy -Config $Config
                     Save-AfsBrowserState -Applied $false
                     $log.browser = 'url-clean'
-                    Invoke-AfsBrowserWindowClose -Config $Config -RestartAll
+                    if (-not (Invoke-AfsBrowserWindowClose -Config $Config -RestartAll)) { $log.browser += ', restart-debounced' }
                 }
             }
             if (-not $Simulate) { Remove-AfsBrowserClose }
@@ -1631,11 +1836,8 @@ function Get-AfsGitHubToken {
     $p = Get-AfsTokenPath
     if (-not (Test-Path $p)) { return $null }
     try {
-        $enc = [System.IO.File]::ReadAllText($p)
-        $sec = ConvertTo-SecureString $enc
-        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-        try { return [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
-        finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+        . (Join-Path (Split-Path $p -Parent) 'token.ps1')
+        return Get-AfsGithubTokenText -Path $p
     } catch { return $null }
 }
 

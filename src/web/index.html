@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -210,6 +210,8 @@
   .nav-item:hover { background: var(--panel2); color: var(--text); }
   .nav-item.active { background: var(--panel2); color: var(--accent-text); border-color: var(--border); font-weight: 600; }
   .nav-item .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; opacity: .7; }
+  a.nav-item, a.btn { text-decoration: none; }
+  a.btn { display: inline-block; }
 
   /* ---------- 主区 ---------- */
   .main { flex: 1; padding: 26px 32px 60px; max-width: 960px; margin: 0 auto; }
@@ -813,6 +815,21 @@
       scroll-behavior: auto !important;
     }
   }
+
+  /* 学习联动: 手机端推送连续失败时的角标 */
+  .study-badge {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 1px 7px;
+    border-radius: 9px;
+    font-size: 11px;
+    font-weight: 400;
+    line-height: 16px;
+    vertical-align: middle;
+    background: #fdecea;
+    color: #c62828;
+    border: 1px solid #f5c2bd;
+  }
 </style>
 </head>
 <body>
@@ -833,6 +850,7 @@
       <button type="button" class="nav-item" data-tab="stats" role="tab" aria-selected="false" aria-controls="panel-stats" tabindex="-1"><span class="dot" aria-hidden="true"></span>统计</button>
       <button type="button" class="nav-item" data-tab="sync" role="tab" aria-selected="false" aria-controls="panel-sync" tabindex="-1"><span class="dot" aria-hidden="true"></span>账号 / 同步</button>
       <button type="button" class="nav-item" data-tab="about" role="tab" aria-selected="false" aria-controls="panel-about" tabindex="-1"><span class="dot" aria-hidden="true"></span>关于 / 卸载</button>
+      <a class="nav-item nav-ext" data-ext="1" href="/study" target="_blank" rel="noopener" title="打开本机学习台（新标签页）"><span class="dot" aria-hidden="true"></span>学习台 ↗</a>
     </div>
   </nav>
 
@@ -841,7 +859,7 @@
       <h1 id="panelTitle">状态</h1>
       <div class="right">
         <span class="pill" id="topPill">加载中…</span>
-        <span class="pill queue" id="pendingPill" style="display:none" title="强制模式生效期间只允许收紧(新增屏蔽项 / 打开屏蔽开关 / 减少白名单), 这些改动会排队到非屏蔽时段自动生效">⏳ 待生效</span>
+        <span class="pill queue" id="pendingPill" style="display:none" title="强制模式生效期间只允许收紧(新增屏蔽项 / 打开屏蔽开关 / 减少白名单), 这些改动保存时即写入配置, 引擎下一轮自动应用">⏳ 待生效</span>
         <button class="btn small" id="themeBtn" title="自动: 白天 07:00-19:00 浅色, 其余时段暗色 · 点击切到「浅色」" aria-label="切换外观(自动/浅色/暗色)">🌗 自动</button>
         <button class="btn primary" id="saveBtn">💾 保存更改</button>
       </div>
@@ -939,6 +957,30 @@
         <h3>⏰ 屏蔽时间段</h3>
         <div id="windowRows"></div>
         <button class="btn small" id="addWindowBtn">＋ 添加时间段</button>
+      </div>
+
+      <!-- 学习联动 -->
+      <div class="card" id="studyCard">
+        <h3>📚 学习联动<span class="study-badge" id="studyBadge" style="display:none"></span></h3>
+        <div class="switch-row">
+          <div class="lbl">
+            <label class="switch"><input type="checkbox" id="studySwitch"><span class="slider"></span></label>
+            <b>目标没打完就继续屏蔽</b>
+            <span class="hint" style="margin:0">来自 WorkBuddy 学习台</span>
+          </div>
+        </div>
+        <div class="hint">
+          过了今天的屏蔽时段，如果学习台里今天的目标还有没打卡的，就一直屏蔽，直到打完为止（没有结束时间）。
+          读不到学习进度（WorkBuddy 没开 / 数据超过 45 分钟没更新）时会正常解锁，不会把你锁死。
+        </div>
+        <div class="add-row">
+          <button class="btn" id="studySaveBtn">保存</button>
+          <button class="btn" id="studyCheckBtn">立即检查</button>
+          <a class="btn" href="/study" target="_blank" rel="noopener" title="在本机管理目标、打卡、周复盘">打开学习台 ↗</a>
+        </div>
+        <div class="note" id="studyState">-</div>
+        <div class="hint" id="studyPending" style="display:none"></div>
+        <div class="hint" id="studyPrec" style="display:none"></div>
       </div>
     </section>
 
@@ -1186,6 +1228,7 @@ let status = null;
 let acct = null;
 let stats = null;
 let activity = null;
+let study = null;        // 学习联动: { studyHold, flag, active, reason, pending }
 let actLast = 0;        // activity 上次刷新时间; 切到「每日/周/月」视图时据此判断要不要重拉
 let dirty = false;
 let autoFail = 0;   // 自动刷新连续失败次数
@@ -1274,9 +1317,9 @@ function tightenToast(what, why) {
 const SHIELD_KIND = { site: "「屏蔽网页」域名", proc: "「屏蔽进程」", bwin: "「Edge 工作区」" };
 
 /* ---------- 排队中的改动 ----------
-   强制模式生效时段内, 「屏蔽网页 / 屏蔽进程 / 白名单」的改动不再被拒绝, 而是由后端存成
-   pending-config.json (只含锁定字段的补丁), 等本次屏蔽时段结束自动合并进 config。
-   这里把补丁叠进 cfg, 让用户看到的是"期望状态"; 未生效的部分用黄色提示条 + 顶栏胶囊标出来。 */
+   旧版机制: 强制模式生效时段内, 「屏蔽网页 / 屏蔽进程 / 白名单」的收紧改动曾被存成
+   pending-config.json 等时段结束再合并; 现在收紧类改动已改为保存时立即落地,
+   这里保留对旧队列文件的兼容展示(历史遗留的 pending 会显示成黄色提示条)。 */
 function deepMergePatch(target, patch) {
   Object.keys(patch || {}).forEach(k => {
     const pv = patch[k], tv = target[k];
@@ -1321,10 +1364,10 @@ async function load() {
     // 核心: 决定整页能不能渲染
     Promise.allSettled([api("/api/config"), api("/api/status")]),
     // 次要: 账号/统计/活动 —— 挂了也不该影响首屏
-    Promise.allSettled([api("/api/account"), api("/api/stats"), api("/api/activity")]),
+    Promise.allSettled([api("/api/account"), api("/api/stats"), api("/api/activity"), api("/api/study")]),
   ]);
   const [c, s] = coreR;
-  const [a, st, act] = extraR;
+  const [a, st, act, stu] = extraR;
 
   if (c.status === "fulfilled" && c.value && c.value.config) {
     cfg = c.value.config;
@@ -1347,10 +1390,11 @@ async function load() {
   if (act.status === "fulfilled" && act.value) { activity = act.value.activity; actLast = Date.now(); }
   if (st.status === "fulfilled" && st.value) stats = st.value.stats;
   if (st.status === "fulfilled" || act.status === "fulfilled") safeRenderStats();
+  if (stu.status === "fulfilled" && stu.value) { study = stu.value; renderStudy(); }
 
   const ok = !!(cfg && status);
   if (ok) dirty = false;
-  const errs = [["配置", c], ["状态", s], ["账号", a], ["统计", st], ["活动", act]]
+  const errs = [["配置", c], ["状态", s], ["账号", a], ["统计", st], ["活动", act], ["学习", stu]]
     .filter(([, r]) => r.status === "rejected")
     .map(([n, r]) => n + ": " + (r.reason && r.reason.message ? r.reason.message : r.reason));
   return { ok, loaded: cfg || status, err: errs.join("; ") };
@@ -1469,6 +1513,7 @@ const REASON_TEXT = {
   schedule: "计划时段内",
   "override-block": "临时屏蔽中",
   "override-off": "临时解除中",
+  "study-hold": "学习目标没打完,继续屏蔽",
   force: "强制模式生效中(屏蔽时段内)",
   disabled: "总开关已关闭",
   day: "今天不在计划日期",
@@ -1698,7 +1743,7 @@ function renderForce() {
   if (f.enabled) {
     fa.innerHTML =
       `<div class="note">🔒 <b>强制模式已开启</b>(星期循环): <b>${wdShow(fWds)}</b> 的屏蔽时段内自动强制。<br>当前<b>不在强制时段</b>(屏蔽窗口外或非所选星期), 可正常使用; 进入强制时段后将无法关闭, 直到时段结束。要停用请点下方按钮。</div>` +
-      `<div class="note warn" style="margin-top:8px">📅 强制模式开启期间<b>「屏蔽星期」「屏蔽时段」已锁定, 无法修改</b>(防破戒: 它们定义了何时算非屏蔽时段)。「屏蔽网页 / 屏蔽进程 / 白名单」<b>只能收紧不能放宽</b> —— 新增屏蔽项 / 打开屏蔽开关 / 减少白名单会排队到非屏蔽时段自动生效; 删屏蔽项 / 关屏蔽开关 / 加白名单在生效时段内会被<b>直接拒绝</b>。想改星期或时段, 请先点下方按钮关闭强制模式。</div>` +
+      `<div class="note warn" style="margin-top:8px">📅 强制模式开启期间<b>「屏蔽星期」「屏蔽时段」已锁定, 无法修改</b>(防破戒: 它们定义了何时算非屏蔽时段)。「屏蔽网页 / 屏蔽进程 / 白名单」<b>只能收紧不能放宽</b> —— 新增屏蔽项 / 打开屏蔽开关 / 减少白名单<b>保存即写入配置</b>, 引擎下一轮自动应用(不排队), 急用点「⚡ 立即应用」; 删屏蔽项 / 关屏蔽开关 / 加白名单在生效时段内会被<b>直接拒绝</b>。想改星期或时段, 请先点下方按钮关闭强制模式。</div>` +
       `<button class="btn danger" id="forceOffBtn">🔓 关闭强制模式</button>`;
     const off = $("#forceOffBtn");
     if (off) off.addEventListener("click", async () => {
@@ -2264,10 +2309,10 @@ function renderList(sel, arr, kind, delLocked, lockTitle) {
 
 // Tab 切换(键盘可达: 方向键/Home/End 切换, roving tabindex)
 const TAB_TITLES = { status:"状态 / 屏蔽计划", sites:"网站屏蔽", processes:"进程屏蔽", whitelist:"白名单", stats:"统计", sync:"账号 / 同步", about:"关于 / 卸载" };
-const navItems = () => Array.from(document.querySelectorAll(".nav-item"));
+const navItems = () => Array.from(document.querySelectorAll(".nav-item:not([data-ext])"));
 
 // 补齐 tab / tabpanel 语义配对(读屏可用)
-document.querySelectorAll(".nav-item").forEach(el => { if (!el.id) el.id = "tab-" + el.dataset.tab; });
+document.querySelectorAll(".nav-item[data-tab]").forEach(el => { if (!el.id) el.id = "tab-" + el.dataset.tab; });
 document.querySelectorAll(".panel").forEach(p => {
   p.setAttribute("role", "tabpanel");
   p.setAttribute("aria-labelledby", "tab-" + p.id.replace(/^panel-/, ""));
@@ -2453,6 +2498,112 @@ $("#addWindowBtn").addEventListener("click", () => {
   if (forceLocked()) { toast("🔒 强制模式开启中, 屏蔽时段已锁定。请先关闭强制模式再修改。", "err"); return; }
   cfg.schedule.windows.push({ start: "19:00", end: "20:00" });
   renderSchedule(); markDirty();
+});
+
+/* ---------- 学习联动 ---------- */
+function renderStudy() {
+  const sw = $("#studySwitch");
+  if (!sw || !study) return;
+  const hold = study.studyHold || {};
+  const flag = study.flag || {};
+  sw.checked = !!hold.enabled;
+
+  // 防绕过: PC 正在屏蔽中(强制/时段内)不许关这个开关, 服务端同样会拒。
+  // 开关直接置灰, 悬停说明原因; 解除屏蔽后自动恢复可点。
+  const blockedNow = !!study.active;
+  sw.disabled = blockedNow;
+  sw.title = blockedNow ? "屏蔽进行中，此开关暂时不能关闭" : "";
+
+  const reasonText = REASON_TEXT[study.reason] || study.reason || "-";
+  const why = {
+    "flag-missing": "还没读到过学习进度", "flag-stale": "学习进度超过 45 分钟没更新",
+    "flag-outdated": "学习进度不是今天的", "flag-error": "读取学习进度出错",
+    "flag-bad-json": "学习进度文件损坏",
+  };
+  let line;
+  if (!hold.enabled) {
+    line = "开关已关闭：到解锁时段就正常放行。";
+  } else if (!flag.ok) {
+    line = "⚠ 读不到可信的学习进度（" + (why[flag.reason] || flag.reason || "未知") + "），当前按正常解锁处理。";
+  } else if (!(flag.activeCount > 0)) {
+    // 没有"进行中"的目标(还没建 / 都已达成) -> 不锁人, 但要跟"打完了"区分开, 否则看着像功能没生效
+    line = "ℹ 学习台里今天没有进行中的目标，联动暂时不参与判定。当前屏蔽状态：" + reasonText;
+  } else if (flag.allDone) {
+    line = "✅ 今天的目标已全部打卡（进行中 " + flag.activeCount + " 个）。当前屏蔽状态：" + reasonText;
+  } else {
+    line = "⏳ 今天还有 " + flag.pending + " 个目标没打卡，屏蔽会一直延长到打完（没有时间上限）。当前屏蔽状态：" + reasonText;
+  }
+  if (blockedNow) line += " · 屏蔽进行中，此开关暂时不可关闭";
+  $("#studyState").textContent = line;
+
+  const names = Array.isArray(study.pending) ? study.pending : [];
+  const pe = $("#studyPending");
+  if (names.length) { pe.style.display = ""; pe.textContent = "未打卡：" + names.join("、"); }
+  else { pe.style.display = "none"; pe.textContent = ""; }
+
+  // 强制模式/暂停 的优先级高于学习联动, 这时学习进度压根不参与判定, 必须说清楚
+  const prec = $("#studyPrec");
+  if (prec) {
+    let t = "";
+    if (study.reason === "force") {
+      t = "强制模式开启中，屏蔽不受学习进度影响；关掉强制模式后，才会按学习进度决定是否继续屏蔽。";
+    } else if (study.reason === "pause") {
+      t = "当前处于暂停状态，学习联动不参与判定；恢复后才会生效。";
+    }
+    if (t) { prec.style.display = ""; prec.textContent = "ℹ " + t; }
+    else { prec.style.display = "none"; prec.textContent = ""; }
+  }
+
+  // 手机端数据的推送状态：连续 2 次(约 30 分钟)推不上去就亮角标。
+  // 不亮的话，"手机还锁着 / 已经不锁了"只能翻 study-gist.log 才知道。
+  const badge = $("#studyBadge");
+  if (badge) {
+    const g = study.gist || {};
+    const fails = Number(g.fails || 0);
+    if (fails >= 2) {
+      badge.style.display = "";
+      badge.textContent = "⚠ 推送失败 " + fails + " 次";
+      const bits = [];
+      if (g.lastFail) bits.push("最近失败 " + g.lastFail);
+      if (g.lastOk) bits.push("最近成功 " + g.lastOk);
+      if (g.error) bits.push(g.error);
+      badge.title = "手机端拿不到最新学习进度，学习闸门在手机上会按旧数据（超过 45 分钟即失效）。\n" + bits.join(" · ");
+    } else {
+      badge.style.display = "none";
+      badge.textContent = "";
+      badge.title = "";
+    }
+  }
+}
+
+const studySaveBtn = $("#studySaveBtn");
+if (studySaveBtn) studySaveBtn.addEventListener("click", async () => {
+  studySaveBtn.disabled = true;
+  try {
+    const r = await api("/api/study/hold", "POST", {
+      enabled: $("#studySwitch").checked,
+    });
+    if (r && r.studyHold) { study = Object.assign({}, study, { studyHold: r.studyHold }); renderStudy(); }
+    toast("学习联动已保存", "ok");
+  } catch (e) { toast(e.message, "err"); }
+  finally { studySaveBtn.disabled = false; }
+});
+
+const studyCheckBtn = $("#studyCheckBtn");
+if (studyCheckBtn) studyCheckBtn.addEventListener("click", async () => {
+  const old = studyCheckBtn.textContent;
+  studyCheckBtn.disabled = true;
+  studyCheckBtn.textContent = "检查中…";
+  try {
+    const r = await api("/api/study/check", "POST", {});
+    study = Object.assign({}, study, { flag: r.flag });
+    renderStudy();
+    const f = r.flag || {};
+    if (!f.ok) toast("读取学习进度失败", "err");
+    else if (f.allDone) toast("今天的目标已全部打卡", "ok");
+    else toast("还有 " + f.pending + " 个目标没打卡");
+  } catch (e) { toast(e.message, "err"); }
+  finally { studyCheckBtn.disabled = false; studyCheckBtn.textContent = old; }
 });
 
 // 网站预设

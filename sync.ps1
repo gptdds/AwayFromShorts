@@ -42,7 +42,16 @@ $files = @(
     'uninstall.ps1',
     'close-browser.vbs',
     'config.example.json',
-    'web\index.html'
+    'web\index.html',
+    'web\study.html',
+    'token.ps1',
+    'push_gist.ps1',
+    'hub_config.ps1',
+    'push_phone_repo.ps1',
+    'apply_checkins.py',
+    'check_study.py',
+    'study_sync.py',
+    'sync_activity.py'
 )
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'

@@ -26,10 +26,20 @@ $runtimeFiles = @(
     'config.json', 'last-run.json', 'github-token.enc',
     'sync-state.json', 'force-state.json', 'clash-state.json',
     'browser-state.json', 'browser-close.json', 'browser-close.log',
-    'stats.json', 'activity.json'
+    'stats.json', 'activity.json',
+    'study-db.json', 'focus-local.json', 'study.flag',
+    'browser-restart.json', 'browser-restart.pending.json', 'browser-close.heartbeat',
+    'hub-state.json', 'study-gist-state.json', 'checkin-queue.local.json',
+    'phone-activity.cache.json', 'study-gist.log', 'study-sync.log', 'hub-config.log',
+    '.webui-restart.timestamp'
 )
 Get-ChildItem (Join-Path $stage 'src') -File |
     Where-Object { $runtimeFiles -contains $_.Name } |
+    Remove-Item -Force
+
+# 安装目录里翻出来的 *.bak-时间戳 同样不能进包（含 web 子目录）
+Get-ChildItem (Join-Path $stage 'src') -Recurse -File |
+    Where-Object { $_.Name -like '*.bak-*' } |
     Remove-Item -Force
 
 if (-not (Test-Path $dist)) { New-Item -ItemType Directory -Path $dist | Out-Null }
