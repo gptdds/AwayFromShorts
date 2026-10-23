@@ -10,7 +10,9 @@
 ---
 
 This repository is the **Windows** side: hosts-level site blocking, process killing, browser-window
-closing, and a local web panel. Pure PowerShell, zero dependencies.
+closing, and a local web panel. The blocker itself is pure PowerShell with zero dependencies;
+only the optional Study desk needs Python 3 to compute daily check-in progress —
+without it the study gate is simply skipped, blocking keeps working.
 
 The **Android** side (Device Owner freeze / accessibility blocker) lives in a separate repo:
 **[sdgfdii/AwayFromShorts-Phone](https://github.com/sdgfdii/AwayFromShorts-Phone)**.
@@ -43,6 +45,8 @@ The panel UI is Chinese-only.
 | **Temp override** | "Block 30 min" / "Unblock 30 min", auto-reverts on expiry |
 | **Stats** | Every override is logged (count + duration), plus ActivityWatch-style time-per-app tracking |
 | **Gist sync** | Push/pull the config to a private GitHub Gist; token is DPAPI-encrypted locally |
+| **Study desk** | Local goal tracker at `/study`: daily check-ins, board, weekly review, focus log — data never leaves the machine |
+| **Study gate** | After the block window ends, keep blocking until today's goals are checked in (no end time); fails open when progress can't be read |
 
 ### Force mode
 
