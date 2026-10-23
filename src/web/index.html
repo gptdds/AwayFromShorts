@@ -210,8 +210,13 @@
   .nav-item:hover { background: var(--panel2); color: var(--text); }
   .nav-item.active { background: var(--panel2); color: var(--accent-text); border-color: var(--border); font-weight: 600; }
   .nav-item .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; opacity: .7; }
-  a.nav-item, a.btn { text-decoration: none; }
-  a.btn { display: inline-block; }
+  /* 学习台: 内嵌 iframe，高度按视口算，滚动交给页面自己 */
+  .study-frame-wrap {
+    border: 1px solid var(--border); border-radius: var(--radius);
+    overflow: hidden; background: var(--panel);
+  }
+  #studyFrame { display: block; width: 100%; height: 640px; border: 0; background: var(--panel); }
+
 
   /* ---------- 主区 ---------- */
   .main { flex: 1; padding: 26px 32px 60px; max-width: 960px; margin: 0 auto; }
@@ -848,9 +853,9 @@
       <button type="button" class="nav-item" data-tab="processes" role="tab" aria-selected="false" aria-controls="panel-processes" tabindex="-1"><span class="dot" aria-hidden="true"></span>进程屏蔽</button>
       <button type="button" class="nav-item" data-tab="whitelist" role="tab" aria-selected="false" aria-controls="panel-whitelist" tabindex="-1"><span class="dot" aria-hidden="true"></span>白名单</button>
       <button type="button" class="nav-item" data-tab="stats" role="tab" aria-selected="false" aria-controls="panel-stats" tabindex="-1"><span class="dot" aria-hidden="true"></span>统计</button>
+      <button type="button" class="nav-item" data-tab="study" role="tab" aria-selected="false" aria-controls="panel-study" tabindex="-1"><span class="dot" aria-hidden="true"></span>学习台</button>
       <button type="button" class="nav-item" data-tab="sync" role="tab" aria-selected="false" aria-controls="panel-sync" tabindex="-1"><span class="dot" aria-hidden="true"></span>账号 / 同步</button>
       <button type="button" class="nav-item" data-tab="about" role="tab" aria-selected="false" aria-controls="panel-about" tabindex="-1"><span class="dot" aria-hidden="true"></span>关于 / 卸载</button>
-      <a class="nav-item nav-ext" data-ext="1" href="/study" target="_blank" rel="noopener" title="打开本机学习台（新标签页）"><span class="dot" aria-hidden="true"></span>学习台 ↗</a>
     </div>
   </nav>
 
@@ -976,7 +981,7 @@
         <div class="add-row">
           <button class="btn" id="studySaveBtn">保存</button>
           <button class="btn" id="studyCheckBtn">立即检查</button>
-          <a class="btn" href="/study" target="_blank" rel="noopener" title="在本机管理目标、打卡、周复盘">打开学习台 ↗</a>
+          <button class="btn" id="studyOpenBtn" type="button" title="切到学习台页签">打开学习台</button>
         </div>
         <div class="note" id="studyState">-</div>
         <div class="hint" id="studyPending" style="display:none"></div>
@@ -1215,6 +1220,13 @@
         <div class="note" id="uninstallManualNote">也可以手动运行 <code>%LOCALAPPDATA%\AwayFromShorts\uninstall.bat</code>(需管理员)。</div>
       </div>
     </section>
+    <!-- ============ 学习台(内嵌学习目标管理台) ============ -->
+    <section class="panel" id="panel-study">
+      <div class="study-frame-wrap">
+        <iframe id="studyFrame" title="学习台" src="about:blank" data-src="/study?embed=1" loading="lazy"></iframe>
+      </div>
+    </section>
+
   </main>
 </div>
 
@@ -2308,11 +2320,11 @@ function renderList(sel, arr, kind, delLocked, lockTitle) {
 /* ================= 事件 ================= */
 
 // Tab 切换(键盘可达: 方向键/Home/End 切换, roving tabindex)
-const TAB_TITLES = { status:"状态 / 屏蔽计划", sites:"网站屏蔽", processes:"进程屏蔽", whitelist:"白名单", stats:"统计", sync:"账号 / 同步", about:"关于 / 卸载" };
-const navItems = () => Array.from(document.querySelectorAll(".nav-item:not([data-ext])"));
+const TAB_TITLES = { status:"状态 / 屏蔽计划", sites:"网站屏蔽", processes:"进程屏蔽", whitelist:"白名单", stats:"统计", study:"学习台", sync:"账号 / 同步", about:"关于 / 卸载" };
+const navItems = () => Array.from(document.querySelectorAll(".nav-item"));
 
 // 补齐 tab / tabpanel 语义配对(读屏可用)
-document.querySelectorAll(".nav-item[data-tab]").forEach(el => { if (!el.id) el.id = "tab-" + el.dataset.tab; });
+document.querySelectorAll(".nav-item").forEach(el => { if (!el.id) el.id = "tab-" + el.dataset.tab; });
 document.querySelectorAll(".panel").forEach(p => {
   p.setAttribute("role", "tabpanel");
   p.setAttribute("aria-labelledby", "tab-" + p.id.replace(/^panel-/, ""));
@@ -2355,6 +2367,7 @@ function activateTab(el) {
     const changed = !!(current && current !== target);
     document.querySelectorAll(".panel").forEach(x => x.classList.remove("active", "leaving"));
     if (target) { target.classList.add("active"); playPanelEnter(target); }
+    if (tab === "study") mountStudyFrame();
     if (changed) { const m = $(".main"); if (m) m.scrollTop = 0; }
   };
 
@@ -2369,6 +2382,25 @@ function activateTab(el) {
   $("#panelTitle").textContent = TAB_TITLES[tab] || "";
   if (tab === "stats") refreshStats(true);   // 进入统计页时拉最新数据(静默: 面板没起来时不该弹错误)
 }
+
+/* ---------- 学习台: 懒加载 + 撑满可视区 ---------- */
+let studyMounted = false;
+function mountStudyFrame() {
+  const f = $("#studyFrame");
+  if (!f) return;
+  if (!studyMounted) {        // 第一次进这个页签才发请求，面板打开时不白白加载 140KB
+    f.src = f.dataset.src;
+    studyMounted = true;
+  }
+  fitStudyFrame();
+}
+function fitStudyFrame() {
+  const f = $("#studyFrame");
+  if (!f || !f.offsetParent) return;   // 页签没显示时不算，避免拿到 0/负值
+  const top = f.getBoundingClientRect().top;
+  f.style.height = Math.max(520, Math.round(window.innerHeight - top - 28)) + "px";
+}
+window.addEventListener("resize", fitStudyFrame);
 
 /* 切页入场动效: 只在这里触发(定时刷新不重播, 避免每 20s 闪一次) */
 function playPanelEnter(panel) {
@@ -2391,6 +2423,14 @@ navItems().forEach(el => {
     if (next) { e.preventDefault(); next.focus(); activateTab(next); }
   });
 });
+
+/* 深链: #study 之类刷新后停在同一个页签(也方便截图/排查) */
+(() => {
+  const want = (location.hash || "").replace("#", "");
+  if (!want) return;
+  const el = document.querySelector('.nav-item[data-tab="' + want + '"]');
+  if (el) activateTab(el);
+})();
 
 /* ---------- 鼠标跟随高光: 只写 CSS 变量, rAF 节流, 不触发重排 ---------- */
 (() => {
@@ -2575,6 +2615,12 @@ function renderStudy() {
     }
   }
 }
+
+const studyOpenBtn = $("#studyOpenBtn");
+if (studyOpenBtn) studyOpenBtn.addEventListener("click", () => {
+  const t = document.querySelector('.nav-item[data-tab="study"]');
+  if (t) activateTab(t);
+});
 
 const studySaveBtn = $("#studySaveBtn");
 if (studySaveBtn) studySaveBtn.addEventListener("click", async () => {

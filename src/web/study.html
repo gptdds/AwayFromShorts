@@ -912,6 +912,30 @@ svg{display:block}
   };
 })();
 </script>
+<style id="embedStyle">
+/* ?embed=1：被面板 iframe 内嵌时用的紧凑布局 —— 去掉自己的侧栏(宽度 <1024 时本来就隐藏)、
+   压缩留白，导航由页面自带的 tablet 横向 tab 条承担，避免和面板侧栏叠成两层。 */
+html.embed .wrap { padding: 14px 14px 56px; }
+html.embed .top-in { padding: 9px 14px; }
+html.embed .side { display: none !important; }
+html.embed .tabs-wrap .nav { padding: 6px 12px; }
+html.embed .toast { bottom: 12px; }
+/* 万一被塞进 >1024 的容器(直接开 ?embed=1 的大窗口): 侧栏已被隐藏，
+   必须把 tablet 那条横向导航补回来，否则整页没有导航 */
+@media (min-width:1024px) {
+  html.embed .tabs-wrap {
+    display: block; position: sticky; top: 0; z-index: 45;
+    background: rgba(245,246,250,.9); backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--line);
+  }
+  html.embed .tabs-wrap .nav {
+    flex-direction: row; max-width: 1140px; margin: 0 auto; padding: 8px 18px; gap: 6px;
+  }
+  html.embed .tabs-wrap .nav-btn { width: auto; flex: 1 1 auto; justify-content: center; }
+  html.embed .tabs-wrap .nav-cnt { display: none; }
+}
+</style>
+<script>if (/[?&]embed=1/.test(location.search)) document.documentElement.className += " embed";</script>
 <script id="appScript">
 (function(){
 "use strict";
