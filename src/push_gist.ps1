@@ -111,28 +111,25 @@ try {
 
     # ---------- 3.5 组 pc-activity.json（手机统计页用的电脑端应用时长） ----------
     # activity.json 是面板每 60 秒采样聚合的（core.ps1 唯一写入方）。
-    # 全量 40KB+ 太大，切最近 14 天、每天只留 apps、按分钟降序截前 12 —— 手机统计页够用。
+    # 日排行保留近 14 天前 12 个；本月与累计从完整应用记录汇总，避免排行截断漏算。
     $files = @{ 'study-gate.json' = @{ content = $json } }
     try {
         $actPath = Join-Path $here 'activity.json'
         if (Test-Path $actPath) {
             $act = ConvertFrom-Json ([System.IO.File]::ReadAllText($actPath, [System.Text.Encoding]::UTF8))
-            $slice = [ordered]@{}
-            $dayKeys = @($act.days.PSObject.Properties.Name | Sort-Object | Select-Object -Last 14)
-            foreach ($k in $dayKeys) {
-                $apps = $act.days.$k.apps
-                if (-not $apps) { continue }
-                $pairs = @($apps.PSObject.Properties |
-                    Sort-Object { [int]$_.Value } -Descending | Select-Object -First 12)
-                $o = [ordered]@{}
-                foreach ($p in $pairs) { $o[$p.Name] = [int]$p.Value }
-                if ($o.Count -gt 0) { $slice[$k] = @{ apps = $o } }
+            . (Join-Path $here 'activity-summary.ps1')
+            $historyPath = Join-Path $here 'pc-activity-history.json'
+            $history = $null
+            if (Test-Path $historyPath) {
+                $history = ConvertFrom-Json ([System.IO.File]::ReadAllText($historyPath, [System.Text.Encoding]::UTF8))
             }
-            if ($slice.Count -gt 0) {
-                $pcj = [ordered]@{
-                    updated = Get-Date -Format 'yyyy-MM-dd HH:mm'
-                    days    = $slice
-                }
+            $summary = Get-AfsPcActivitySummary -Activity $act -History $history
+            if ($summary.payload.days.Count -gt 0) {
+                $historyTemp = $historyPath + '.tmp'
+                [System.IO.File]::WriteAllText($historyTemp, ($summary.history | ConvertTo-Json -Compress -Depth 8),
+                    (New-Object System.Text.UTF8Encoding($false)))
+                Move-Item -LiteralPath $historyTemp -Destination $historyPath -Force
+                $pcj = $summary.payload
                 $files['pc-activity.json'] = @{
                     content = ($pcj | ConvertTo-Json -Compress -Depth 6)
                 }
