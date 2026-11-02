@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -221,6 +221,8 @@
   /* ---------- 主区 ---------- */
   .main { flex: 1; padding: 26px 32px 60px; max-width: 960px; margin: 0 auto; }
   .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 22px; gap: 12px; flex-wrap: wrap; }
+  .main.study-view > .topbar { display: none; }
+  .main.study-view { max-width: none; min-width: 0; margin: 0; padding: 14px 14px 28px; }
   /* spec §4.2: 大标题 24px / 行高 1.5 / 字重 500 / 字距 normal (b 站不用负字距) */
   .topbar h1 {
     font-size: 24px; line-height: 1.5; font-weight: 500;
@@ -848,20 +850,20 @@
       </div>
     </div>
     <div class="nav-list" role="tablist" aria-orientation="vertical" aria-label="功能页面">
-      <button type="button" class="nav-item active" data-tab="status" role="tab" aria-selected="true" aria-controls="panel-status" tabindex="0"><span class="dot" aria-hidden="true"></span>状态 / 屏蔽计划</button>
+      <button type="button" class="nav-item active" data-tab="study" role="tab" aria-selected="true" aria-controls="panel-study" tabindex="0"><span class="dot" aria-hidden="true"></span>学习台</button>
+      <button type="button" class="nav-item" data-tab="status" role="tab" aria-selected="false" aria-controls="panel-status" tabindex="-1"><span class="dot" aria-hidden="true"></span>状态 / 屏蔽计划</button>
       <button type="button" class="nav-item" data-tab="sites" role="tab" aria-selected="false" aria-controls="panel-sites" tabindex="-1"><span class="dot" aria-hidden="true"></span>网站屏蔽</button>
       <button type="button" class="nav-item" data-tab="processes" role="tab" aria-selected="false" aria-controls="panel-processes" tabindex="-1"><span class="dot" aria-hidden="true"></span>进程屏蔽</button>
       <button type="button" class="nav-item" data-tab="whitelist" role="tab" aria-selected="false" aria-controls="panel-whitelist" tabindex="-1"><span class="dot" aria-hidden="true"></span>白名单</button>
       <button type="button" class="nav-item" data-tab="stats" role="tab" aria-selected="false" aria-controls="panel-stats" tabindex="-1"><span class="dot" aria-hidden="true"></span>统计</button>
-      <button type="button" class="nav-item" data-tab="study" role="tab" aria-selected="false" aria-controls="panel-study" tabindex="-1"><span class="dot" aria-hidden="true"></span>学习台</button>
       <button type="button" class="nav-item" data-tab="sync" role="tab" aria-selected="false" aria-controls="panel-sync" tabindex="-1"><span class="dot" aria-hidden="true"></span>账号 / 同步</button>
       <button type="button" class="nav-item" data-tab="about" role="tab" aria-selected="false" aria-controls="panel-about" tabindex="-1"><span class="dot" aria-hidden="true"></span>关于 / 卸载</button>
     </div>
   </nav>
 
-  <main class="main">
+  <main class="main study-view">
     <div class="topbar">
-      <h1 id="panelTitle">状态</h1>
+      <h1 id="panelTitle">学习台</h1>
       <div class="right">
         <span class="pill" id="topPill">加载中…</span>
         <span class="pill queue" id="pendingPill" style="display:none" title="强制模式生效期间只允许收紧(新增屏蔽项 / 打开屏蔽开关 / 减少白名单), 这些改动保存时即写入配置, 引擎下一轮自动应用">⏳ 待生效</span>
@@ -870,8 +872,8 @@
       </div>
     </div>
 
-    <!-- ============ 状态 (首页) ============ -->
-    <section class="panel active" id="panel-status">
+    <!-- ============ 状态 / 屏蔽计划 ============ -->
+    <section class="panel" id="panel-status">
       <!-- 状态大卡片 -->
       <div class="home-hero" id="homeHero">
         <div class="hl">
@@ -916,6 +918,52 @@
         </div>
       </div>
 
+      <div class="card">
+        <h3>应用每日限额 · 独立 / 共享</h3>
+        <p id="gameQuotaStatus">正在读取额度…</p>
+        <div id="quotaUsage" style="display:grid;gap:8px;margin:14px 0"></div>
+        <p id="quotaEditWindow" role="status">正在检查修改时段…</p>
+        <form id="quotaSettings">
+          <fieldset id="quotaEditFields" style="border:0;padding:0;margin:18px 0;display:grid;gap:14px;min-width:0">
+            <label><input type="checkbox" id="quotaEnabled"> 启用每日限额</label>
+            <div id="quotaRules" style="display:grid;gap:14px"></div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button type="button" class="btn" id="quotaAddValorant">添加无畏契约</button>
+              <button type="button" class="btn" id="quotaAddSteam">添加 Steam（含游戏）</button>
+              <button type="button" class="btn" id="quotaMergeGames">无畏契约 + Steam 合为共享格子</button>
+            </div>
+            <details><summary>从正在运行的应用中选择</summary>
+              <button type="button" class="btn" id="quotaRefreshApps" style="margin:10px 0">刷新应用列表</button>
+              <div id="quotaAppList" style="display:grid;gap:8px;max-height:240px;overflow:auto">请先打开应用，再刷新列表。</div>
+            </details>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <input id="quotaProcessName" type="text" placeholder="进程名，例如 chrome.exe" aria-label="应用进程名称" style="flex:1;min-width:180px">
+              <button type="button" class="btn" id="quotaAddApp">添加应用</button>
+            </div>
+            <div><button type="submit" class="btn primary" id="quotaSave">保存应用和时长</button></div>
+          </fieldset>
+          <p id="quotaSaveStatus" role="status"></p>
+        </form>
+        <div class="note">独立格子：各自设置时长；共享格子：无畏契约、Steam 和你加进来的其他进程共用一份时长。只计前台时间，用尽后关闭对应格子中的应用，次日零点重置。合并、拆分均保留今天各应用已用时间。<b>规定时间以外（非 21:00–21:59）应用和进程「只进不出」</b>：可以新增应用、往共享格子加进程，不能删除、拆分或改时长；完整修改只在每天 21:00–21:59 开放。原有屏蔽规则仍然生效。</div>
+      </div>
+      <!-- 跨设备共享额度 -->
+      <div class="card" id="lanCard">
+        <h3>跨设备共享额度</h3>
+        <p id="lanStatus">正在读取跨设备状态…</p>
+        <div id="lanDetail" style="display:grid;gap:6px;margin:12px 0"></div>
+        <label><input type="checkbox" id="lanEnabled"> 启用跨设备共享（电脑是权威账本）</label>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px">
+          <label>端口 <input id="lanPort" type="number" min="1024" max="65535" step="1" style="width:96px" aria-label="局域网端口"></label>
+          <label style="flex:1;min-width:240px">令牌 <input id="lanToken" type="text" spellcheck="false" style="width:100%" aria-label="连接令牌"></label>
+          <button type="button" class="btn" id="lanNewToken">重新生成</button>
+          <button type="button" class="btn" id="lanCopyToken">复制</button>
+        </div>
+        <div id="lanAddress" class="note" style="margin-top:12px">-</div>
+        <div id="lanSharedRule" class="note" style="margin-top:4px">-</div>
+        <div style="margin-top:14px"><button type="button" class="btn primary" id="lanSave">保存跨设备设置</button></div>
+        <p id="lanSaveStatus" role="status"></p>
+        <div class="note">电脑是权威账本：手机在同一个 WiFi 下每 3 秒上报自己那一份用量，两边合计到池子上限就同时停。手机出门后改用 Gist 上最近一次的账，分钟级延迟、数字偏乐观。共享哪一条格子，在上面的「应用每日限额」里点那条的「⇄ 跨设备」；池子上限就是那条格子的分钟数。停用、换令牌、换端口都等于把手机挡在门外，只在每天 21:00–21:59 开放。</div>
+      </div>
       <!-- 详细状态 -->
       <div class="card">
         <h3>当前状态</h3>
@@ -1005,7 +1053,7 @@
             <b>屏蔽网站</b>
           </div>
         </div>
-        <div class="hint">勾选常用网站预设,或添加自定义域名。屏蔽期间这些域名将无法访问(整站屏蔽,不能只屏蔽某个频道的短视频)。</div>
+        <div class="hint">勾选常用网站预设,或添加自定义域名。屏蔽期间这些域名将无法访问(整站屏蔽,不能只屏蔽某个频道的短视频)。<br><span class="muted">屏蔽时段内名单只能新增、不能删减;非屏蔽时段可自由增删。</span></div>
         <div class="red-note" id="sitesLockNote" style="display:none;margin-top:10px"></div>
       </div>
       <div class="card">
@@ -1015,7 +1063,7 @@
             <b>屏蔽 Edge 工作区(如娱乐)</b>
           </div>
         </div>
-        <div class="hint">Edge 工作区窗口的<b>标题就是工作区名</b>,填入工作区名(如"娱乐")即可屏蔽整个工作区:屏蔽期间该工作区的窗口会被<b>自动优雅关闭</b>(反复打开也会再被关闭),其他窗口 / 工作区完全不受影响,可正常学习工作。点"检测工作区窗口"可列出当前打开的 Edge 窗口标题,直接选中即加入。</div>
+        <div class="hint">Edge 工作区窗口的<b>标题就是工作区名</b>,填入工作区名(如"娱乐")即可屏蔽整个工作区:屏蔽期间该工作区的窗口会被<b>自动优雅关闭</b>(反复打开也会再被关闭),其他窗口 / 工作区完全不受影响,可正常学习工作。点"检测工作区窗口"可列出当前打开的 Edge 窗口标题,直接选中即加入。<br><span class="muted">屏蔽时段内只能新增、不能删减;非屏蔽时段可自由增删。</span></div>
         <div class="add-row">
           <input id="browserWinInput" placeholder="工作区名, 支持 * 通配符, 例如: 娱乐" spellcheck="false">
           <button class="btn" id="addBrowserWinBtn">添加</button>
@@ -1054,7 +1102,7 @@
         </div>
       </div>
       <div class="card">
-        <div class="hint">屏蔽期间,匹配的进程会被强制结束(每 1 分钟检查一次,反复打开的也会被杀掉)。进程名不区分大小写,可不写 .exe,支持 <code>*</code> 通配符。</div>
+        <div class="hint">屏蔽期间,匹配的进程会被强制结束(每 1 分钟检查一次,反复打开的也会被杀掉)。进程名不区分大小写,可不写 .exe,支持 <code>*</code> 通配符。<br><span class="muted">屏蔽时段内只能新增、不能删减;非屏蔽时段可自由增删。</span></div>
         <div class="red-note" id="procLockNote" style="display:none;margin-top:10px"></div>
       </div>
       <div class="card">
@@ -1082,7 +1130,7 @@
       </div>
       <div class="card">
         <h3>🛡 白名单域名</h3>
-        <div class="hint">白名单优先于屏蔽。两种写法:<br>· <b>纯域名</b> <code>mail.example.com</code> — 整站放行(即使被屏蔽)<br>· <b>域名+路径</b> <code>www.bilibili.com/video/*</code> — 只放行该路径, 同域名的其他页面仍按屏蔽表处置<br><span class="muted">路径放行依赖浏览器 URLBlocklist/URLAllowlist(需开启「网址拦截」并重启浏览器生效); hosts 层面仍是整站封。</span></div>
+        <div class="hint">白名单优先于屏蔽。两种写法:<br>· <b>纯域名</b> <code>mail.example.com</code> — 整站放行(即使被屏蔽)<br>· <b>域名+路径</b> <code>www.bilibili.com/video/*</code> — 只放行该路径, 同域名的其他页面仍按屏蔽表处置<br><span class="muted">路径放行依赖浏览器 URLBlocklist/URLAllowlist(需开启「网址拦截」并重启浏览器生效); hosts 层面仍是整站封。</span><br><span class="muted">屏蔽时段内白名单只进不出(不能加也不能删);非屏蔽时段可自由增删。</span></div>
         <div class="red-note" id="wlLockNote" style="display:none;margin-top:10px"></div>
         <div class="add-row">
           <input id="wlSiteInput" placeholder="例如: mail.example.com 或 www.bilibili.com/video/*" spellcheck="false">
@@ -1092,7 +1140,7 @@
       </div>
       <div class="card">
         <h3>🛡 白名单进程</h3>
-        <div class="hint">即使出现在屏蔽列表里,这些进程也永远不会被结束(支持通配符)。</div>
+        <div class="hint">即使出现在屏蔽列表里,这些进程也永远不会被结束(支持通配符)。<br><span class="muted">屏蔽时段内白名单只进不出(不能加也不能删);非屏蔽时段可自由增删。</span></div>
         <div class="add-row">
           <input id="wlProcInput" placeholder="例如: Teams" spellcheck="false">
           <button class="btn" id="addWlProcBtn">添加</button>
@@ -1221,7 +1269,7 @@
       </div>
     </section>
     <!-- ============ 学习台(内嵌学习目标管理台) ============ -->
-    <section class="panel" id="panel-study">
+    <section class="panel active" id="panel-study">
       <div class="study-frame-wrap">
         <iframe id="studyFrame" title="学习台" src="about:blank" data-src="/study?embed=1" loading="lazy"></iframe>
       </div>
@@ -1286,6 +1334,306 @@ function toast(msg, kind = "") {
   toastTimer = setTimeout(() => { t.className = "toast"; }, 2600);
 }
 
+let quotaDirty = false, quotaRules = [], quotaApps = [], quotaAllowed = false;
+const quotaRuleId = r => r.type === 'process' ? 'process:' + r.name.toLowerCase().replace(/\.exe$/i, '') : r.type;
+function quotaChanged() {
+  quotaDirty = true;
+  document.getElementById('quotaSaveStatus').textContent = '有未保存的修改';
+}
+function addQuotaRule(type, name) {
+  // 规定时间以外只允许"进": 新增应用 / 进程可以, 无畏契约和 Steam 的增删要等 21:00 窗口
+  if (!quotaAllowed && type !== 'process') { toast('规定时间以外只能新增应用或进程; 无畏契约 / Steam 的增删请等每天 21:00–21:59','err'); return; }
+  name = name.trim().replace(/\.exe$/i, '').toLowerCase();
+  if (type === 'process' && ['steam','steamwebhelper'].includes(name)) type = 'steam';
+  if (type === 'process' && ['valorant','valorant-win64-shipping','无畏契约登录器'].includes(name)) type = 'valorant';
+  if (type === 'steam') name = 'Steam（含 Steam 游戏）';
+  if (type === 'valorant') name = '无畏契约';
+  if (['steam','valorant'].includes(type) && quotaRules.some(r => r.type === 'games')) { toast('已在共享格子中，请先拆分'); return; }
+  const rule = {type, name, dailyMinutes:120};
+  if (quotaRules.some(r => quotaRuleId(r) === quotaRuleId(rule))) { toast('该应用已经添加'); return; }
+  quotaRules.push(rule); quotaChanged(); renderQuotaRules();
+}
+const quotaSharedName = list => {
+  const extra = (list || []).filter(Boolean);
+  return extra.length ? '无畏契约 + Steam + ' + extra.join(' + ') + '（共享）' : '无畏契约 + Steam（共享）';
+};
+function renderQuotaRules() {
+  const container = document.getElementById('quotaRules'); container.replaceChildren();
+  if (!quotaRules.length) container.textContent = '尚未选择应用';
+  quotaRules.forEach((rule, index) => {
+    const row = document.createElement('div'); row.style.cssText = 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:12px;border:1px solid rgba(128,128,128,.3);border-radius:12px';
+    const label = document.createElement('label'); label.textContent = rule.name + ' 每天 ';
+    const input = document.createElement('input'); input.type='number'; input.min='1'; input.max='1440'; input.step='1'; input.required=true;
+    input.value=rule.dailyMinutes; input.style.width='100px'; input.setAttribute('aria-label', rule.name + ' 每日分钟数');
+    input.oninput=() => { rule.dailyMinutes=Number(input.value); quotaChanged(); };
+    input.disabled = !quotaAllowed;
+    label.append(input,document.createTextNode(' 分钟'));
+    const remove=document.createElement('button'); remove.type='button'; remove.className='btn'; remove.textContent='移除'; remove.setAttribute('aria-label','移除 '+rule.name);
+    remove.disabled = !quotaAllowed;
+    if (!quotaAllowed) remove.title = '规定时间以外不能删除, 只能新增';
+    remove.onclick=() => { quotaRules.splice(index,1); quotaChanged(); renderQuotaRules(); };
+    row.append(label,remove);
+    if (rule.type === 'games') {
+      // 共享格子的附加成员: 与无畏契约 / Steam 共用同一份额度
+      (rule.processes || []).forEach((proc, procIndex) => {
+        const chip = document.createElement('span');
+        chip.style.cssText = 'display:inline-flex;align-items:center;gap:6px;background:rgba(128,128,128,.18);border-radius:8px;padding:2px 4px 2px 8px';
+        const name = document.createElement('code'); name.textContent = proc;
+        const del = document.createElement('button'); del.type='button'; del.className='btn small red'; del.textContent='✕';
+        del.title = quotaAllowed ? ('从共享格子移除 ' + proc) : '规定时间以外不能移除共享格子成员';
+        del.disabled = !quotaAllowed;
+        del.setAttribute('aria-label','从共享格子移除 '+proc);
+        del.onclick = () => {
+          rule.processes.splice(procIndex,1);
+          if (!rule.processes.length) delete rule.processes;
+          rule.name = quotaSharedName(rule.processes);
+          quotaChanged(); renderQuotaRules();
+        };
+        chip.append(name, del); row.append(chip);
+      });
+      const join = document.createElement('button'); join.type='button'; join.className='btn'; join.textContent='+ 加入共享格子';
+      join.title = '把另一个进程加进这个共享格子，共用同一份时长';
+      join.onclick = () => {
+        const raw = (prompt('要加进共享格子的进程名（例如 pvzge-0.16.1.exe）', '') || '').trim();
+        if (!raw) return;
+        if (/[\\/:*?"<>|\r\n]/.test(raw)) { toast('请输入进程名，例如 pvzge-0.16.1.exe，不要输入路径','err'); return; }
+        const name = raw.replace(/\.exe$/i,'').toLowerCase();
+        if (['steam','steamwebhelper','valorant','valorant-win64-shipping'].includes(name)) { toast('无畏契约 / Steam 已经在共享格子里了','err'); return; }
+        rule.processes = rule.processes || [];
+        if (rule.processes.includes(name)) { toast('已经在这个共享格子里'); return; }
+        rule.processes.push(name);
+        rule.name = quotaSharedName(rule.processes);
+        quotaChanged(); renderQuotaRules();
+      };
+      row.append(join);
+      const split=document.createElement('button'); split.type='button'; split.className='btn'; split.textContent='拆分为独立限额';
+      split.disabled = !quotaAllowed;
+      if (!quotaAllowed) split.title = '规定时间以外不能拆分 / 删除';
+      split.onclick=() => {
+        const extra=(rule.processes || []).map(p => ({type:'process', name:p, dailyMinutes:rule.dailyMinutes}));
+        quotaRules.splice(index,1,{type:'valorant',name:'无畏契约',dailyMinutes:rule.dailyMinutes},{type:'steam',name:'Steam（含 Steam 游戏）',dailyMinutes:rule.dailyMinutes},...extra);
+        quotaChanged(); renderQuotaRules();
+      };
+      row.append(split);
+    }
+    // 跨设备共享：一个池子只能有一个上限，所以最多一条格子能被打上这个标记。
+    // 已共享的那条按钮高亮，点一下滚到跨设备卡片；未共享的点一下把它设成那一条。
+    const share = document.createElement('button');
+    share.type = 'button';
+    share.className = rule.shared ? 'btn primary' : 'btn';
+    share.textContent = rule.shared ? '⇄ 跨设备 ✓' : '⇄ 跨设备';
+    share.setAttribute('aria-pressed', rule.shared ? 'true' : 'false');
+    share.title = rule.shared
+      ? '这条格子和手机共用一份额度。点一下去下面配地址和令牌。'
+      : '把这条格子设成和手机共用的那一份（同时只能有一条）';
+    share.onclick = () => {
+      if (!rule.shared) {
+        quotaRules.forEach(r => { delete r.shared; });
+        rule.shared = true;
+        quotaChanged(); renderQuotaRules();
+        toast('已标记为跨设备，记得点「保存应用和时长」', 'ok');
+      }
+      const card = document.getElementById('lanCard');
+      if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    };
+    row.append(share);
+    container.append(row);
+  });
+}
+let quotaLockTimer = null;
+function renderQuotaSettings(config, editWindow) {
+  clearTimeout(quotaLockTimer);
+  quotaAllowed = !!editWindow?.allowed;
+  document.getElementById('quotaEditFields').disabled = false;
+  // 规定时间以外: 应用和进程「只进不出」—— 新增可以, 删除 / 改时长 / 关开关不行
+  document.getElementById('quotaEnabled').disabled = !quotaAllowed;
+  document.getElementById('quotaAddValorant').disabled = !quotaAllowed;
+  document.getElementById('quotaAddSteam').disabled = !quotaAllowed;
+  document.getElementById('quotaMergeGames').disabled = !quotaAllowed;
+  document.getElementById('quotaEditWindow').textContent = quotaAllowed
+    ? (editWindow.temporary ? '临时开放修改，截止 ' + new Date(editWindow.until).toLocaleString('zh-CN',{hour12:false}) + '，到期自动锁定' : '当前可修改：每天 21:00–21:59，22:00 自动锁定')
+    : '规定时间以外：应用和进程「只进不出」—— 可以新增应用、往共享格子加进程，不能删除或改时长。完整修改请等每天 21:00–21:59（下次 ' + new Date(editWindow.next).toLocaleString('zh-CN',{hour12:false}) + '）';
+  if (quotaAllowed && editWindow.until) {
+    const delay = Math.max(0, new Date(editWindow.until) - new Date(editWindow.serverTime));
+    quotaLockTimer = setTimeout(() => {
+      quotaAllowed = false; document.getElementById('quotaEditFields').disabled = false;
+      document.getElementById('quotaEditWindow').textContent = '修改权限已到期，已回到「只进不出」模式。';
+      renderQuotaRules();
+      load();
+    }, delay);
+  }
+  if (quotaDirty) return;
+  document.getElementById('quotaEnabled').checked=config.enabled;
+  quotaRules=(config.rules || []).map(r => ({...r})); renderQuotaRules();
+}
+document.getElementById('quotaEnabled').onchange=quotaChanged;
+document.getElementById('quotaAddValorant').onclick=() => addQuotaRule('valorant','无畏契约');
+document.getElementById('quotaAddSteam').onclick=() => addQuotaRule('steam','Steam');
+document.getElementById('quotaMergeGames').onclick=() => {
+  if (!quotaAllowed) return;
+  if (quotaRules.some(r => r.type === 'games')) { toast('已经是共享格子'); return; }
+  const existing=quotaRules.filter(r => ['steam','valorant'].includes(r.type));
+  const minutes=existing.length ? Math.min(...existing.map(r => r.dailyMinutes)) : 120;
+  quotaRules=quotaRules.filter(r => !['steam','valorant'].includes(r.type));
+  quotaRules.push({type:'games',name:'无畏契约 + Steam（共享）',dailyMinutes:minutes});
+  quotaChanged(); renderQuotaRules();
+};
+document.getElementById('quotaAddApp').onclick=() => {
+  const input=document.getElementById('quotaProcessName'), name=input.value.trim();
+  if (!name || /[\\/:*?"<>|\r\n]/.test(name)) { toast('请输入进程名，例如 chrome.exe，不要输入路径','err'); return; }
+  addQuotaRule('process',name); input.value='';
+};
+document.getElementById('quotaRefreshApps').onclick=async () => {
+  const list=document.getElementById('quotaAppList');
+  try {
+    const result=await api('/api/quota-apps'); quotaApps=result.apps || []; list.replaceChildren();
+    if (!quotaApps.length) list.textContent='请先打开应用，再刷新列表。';
+    for (const app of quotaApps) {
+      const button=document.createElement('button'); button.type='button'; button.className='btn'; button.textContent='添加 '+app.title+' ('+app.name+'.exe)';
+      button.onclick=() => addQuotaRule('process',app.name); list.append(button);
+    }
+  } catch(e) { list.textContent=e.message; }
+};
+document.getElementById('quotaSettings').onsubmit=async e => {
+  e.preventDefault();
+  // 规定时间以外也允许提交：面板上的删除/改时长控件本来就禁用了，剩下的只有
+  //「新增应用」「加进程」「设为跨设备」这类只加不减的改动，后端 Test-AfsQuotaAppendOnly
+  // 会逐条把关（连关掉跨设备共享都算放行，一并拦下）。
+  const button=document.getElementById('quotaSave'), message=document.getElementById('quotaSaveStatus');
+  if (document.getElementById('quotaProcessName').value.trim()) { message.textContent='请先点击“添加应用”，再保存'; return; }
+  button.disabled=true;
+  try {
+    const result=await api('/api/game-quota','POST',{version:3,enabled:document.getElementById('quotaEnabled').checked,
+      // shared 显式传给后端：后端据此区分「用户主动关掉共享」和「旧页面没提这个字段」
+      rules:quotaRules.map(r => ({...r, shared: !!r.shared}))});
+    quotaDirty=false; renderQuotaSettings(result.config,result.editWindow); message.textContent='已保存，约 1 秒生效'; toast('应用限额已保存','ok'); await load();
+  } catch(error) { message.textContent=error.message; }
+  finally { button.disabled=false; }
+};
+/* ================= 跨设备共享额度 ================= */
+/* 一个池子、两份用量。判定看合计，但面板要把「谁花的」摊开：
+   电脑这一份是进程，手机那一份是应用，两边都在这里列出来。 */
+let lanInfo = null, lanDirty = false, lastQuota = null;
+
+function lanMinutes(sec) { const m = (Number(sec) || 0) / 60; return m >= 100 ? m.toFixed(0) : m.toFixed(1); }
+function lanDetailText(list) {
+  // 不到 6 秒的条目只会显示成「0.0 分钟」，占位置又没有信息
+  const rows = (list || []).filter(a => a && a.name && Number(a.seconds) >= 6);
+  if (!rows.length) return '今天还没有用量';
+  return rows.map(a => a.name + ' ' + lanMinutes(a.seconds) + ' 分钟').join('、');
+}
+function lanPoolLine(v) {
+  if (!v) return '⇄ 跨设备 · 还没读到池子';
+  const who = v.phoneOnline ? '手机在线' : '手机未连上';
+  return '⇄ 跨设备 · 电脑 ' + lanMinutes(v.pcUsed) + ' + 手机 ' + lanMinutes(v.phoneUsed) +
+    ' = ' + lanMinutes(v.total) + ' / ' + v.poolMinutes + ' 分钟（' + who + '）';
+}
+/** 用量行：普通格子只看自己，跨设备格子看两端的合计，并把两端明细列出来。 */
+function renderQuotaUsage(q) {
+  lastQuota = q || null;
+  const usage = document.getElementById('quotaUsage');
+  if (!usage) return;
+  usage.replaceChildren();
+  if (!q) { usage.textContent = '额度读取失败'; return; }
+  const qs = q.state, lv = lanInfo && lanInfo.view;
+  for (const rule of q.config.rules || []) {
+    const a = qs && qs.apps ? qs.apps[rule.id] : null;
+    const localUsed = (a && a.usedSeconds) || 0;
+    const shared = !!rule.shared;
+    const limit = shared && lv && lv.poolMinutes ? lv.poolMinutes : rule.dailyMinutes;
+    const charged = shared && lv ? (lv.total || 0) : localUsed;
+    const remaining = Math.max(0, limit * 60 - charged);
+    const box = document.createElement('div'); box.style.cssText = 'display:grid;gap:3px';
+    const head = document.createElement('div');
+    head.textContent = rule.name + '：已用 ' + Math.floor(charged / 60) + ' / ' + limit + ' 分钟，剩余 ' +
+      Math.ceil(remaining / 60) + ' 分钟' + (remaining === 0 ? '（已用尽）' : '');
+    box.append(head);
+    if (shared) {
+      const line = (text, color) => {
+        const d = document.createElement('div');
+        d.style.cssText = 'margin:0;font-size:13px;color:' + (color || 'inherit');
+        d.textContent = text;
+        box.append(d);
+      };
+      line(lanPoolLine(lv), '#4a9eff');
+      if (lv) {
+        line('电脑这一份：' + lanDetailText(lv.pcApps));
+        line('手机这一份：' + lanDetailText(lv.phoneApps) + (lv.phoneOnline ? '' : '（手机当前没连上，这是最后一次上报）'));
+      }
+    }
+    usage.append(box);
+  }
+}
+function renderLan(info) {
+  lanInfo = info;
+  const cfg = info.config || {}, v = info.view || {};
+  const st = document.getElementById('lanStatus');
+  if (!cfg.enabled) st.textContent = '未启用：手机不会上报，两边各记各的；启用后电脑这一份才和手机合成一个池子。';
+  else if (!v.phoneOnline) st.textContent = '已启用，但手机还没连上。手机和电脑要在同一个 WiFi 下，地址和令牌都要填对。';
+  else st.textContent = '已启用 · 手机在线' + (v.phoneAt ? '，最近 ' + new Date(v.phoneAt).toLocaleTimeString('zh-CN', { hour12: false }) + ' 上报过' : '') + '。';
+  const detail = document.getElementById('lanDetail'); detail.replaceChildren();
+  const add = (text, color) => {
+    const d = document.createElement('div');
+    d.style.cssText = 'margin:0;font-size:13px;color:' + (color || 'inherit');
+    d.textContent = text; detail.append(d);
+  };
+  if (v.poolMinutes) {
+    add(lanPoolLine(v), '#4a9eff');
+    add('电脑这一份：' + lanDetailText(v.pcApps));
+    add('手机这一份：' + lanDetailText(v.phoneApps) + (cfg.enabled && !v.phoneOnline ? '（手机当前没连上，这是最后一次上报）' : ''));
+  } else {
+    add('还没有池子：先在「应用每日限额」里把某条格子设成「⇄ 跨设备」。');
+  }
+  if (!lanDirty) {
+    document.getElementById('lanEnabled').checked = !!cfg.enabled;
+    document.getElementById('lanPort').value = cfg.port || 8738;
+    document.getElementById('lanToken').value = cfg.token || '';
+  }
+  const addr = (info.addresses || [])[0];
+  document.getElementById('lanAddress').textContent = addr
+    ? '手机端填：' + addr + ':' + (cfg.port || 8738) + ' · 令牌照抄上面那串（手机 设置 → 跨设备 → 共享额度）'
+    : '没读到本机局域网地址（可能只有虚拟网卡），到 ipconfig 里找 192.168.x.x 手动填。';
+  const rule = (quotaRules || []).find(r => r.shared);
+  document.getElementById('lanSharedRule').textContent = rule
+    ? '当前共享的格子：' + rule.name + ' · 池子上限 ' + rule.dailyMinutes + ' 分钟' + (quotaDirty ? '（有未保存的改动，保存后才生效）' : '')
+    : '还没有格子被设为跨设备 —— 在「应用每日限额」里点某条的「⇄ 跨设备」。';
+}
+function lanMarkDirty() {
+  lanDirty = true;
+  document.getElementById('lanSaveStatus').textContent = '有未保存的修改';
+}
+['lanEnabled', 'lanPort', 'lanToken'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) { el.oninput = lanMarkDirty; el.onchange = lanMarkDirty; }
+});
+document.getElementById('lanNewToken').onclick = () => {
+  const bytes = new Uint8Array(8); crypto.getRandomValues(bytes);
+  document.getElementById('lanToken').value = 'afs' + Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  lanMarkDirty();
+};
+document.getElementById('lanCopyToken').onclick = async () => {
+  const input = document.getElementById('lanToken'), value = input.value.trim();
+  if (!value) { toast('还没有令牌', 'err'); return; }
+  try { await navigator.clipboard.writeText(value); toast('令牌已复制', 'ok'); }
+  catch (e) { input.select(); toast('复制失败，已选中文本，请手动复制', 'err'); }
+};
+document.getElementById('lanSave').onclick = async () => {
+  const button = document.getElementById('lanSave'), message = document.getElementById('lanSaveStatus');
+  button.disabled = true;
+  try {
+    const result = await api('/api/quota-lan', 'POST', {
+      enabled: document.getElementById('lanEnabled').checked,
+      port: Number(document.getElementById('lanPort').value),
+      token: document.getElementById('lanToken').value.trim()
+    });
+    lanDirty = false;
+    renderLan(result);
+    message.textContent = result.note || '已保存';
+    toast('跨设备设置已保存', 'ok');
+    if (lastQuota) renderQuotaUsage(lastQuota);
+  } catch (error) { message.textContent = error.message; }
+  finally { button.disabled = false; }
+};
 /* ================= 预设数据 ================= */
 const SITE_PRESETS = [
   { label: "抖音", domains: ["douyin.com","www.douyin.com","v.douyin.com","live.douyin.com"] },
@@ -1376,10 +1724,22 @@ async function load() {
     // 核心: 决定整页能不能渲染
     Promise.allSettled([api("/api/config"), api("/api/status")]),
     // 次要: 账号/统计/活动 —— 挂了也不该影响首屏
-    Promise.allSettled([api("/api/account"), api("/api/stats"), api("/api/activity"), api("/api/study")]),
+    Promise.allSettled([api("/api/account"), api("/api/stats"), api("/api/activity"), api("/api/study"), api("/api/game-quota"), api("/api/quota-lan")]),
   ]);
   const [c, s] = coreR;
-  const [a, st, act, stu] = extraR;
+  const [a, st, act, stu, quota, lan] = extraR;
+  const quotaEl = document.getElementById('gameQuotaStatus');
+  if (quota.status === 'fulfilled') {
+    const q = quota.value, qs = q.state;
+    renderQuotaSettings(q.config, q.editWindow);
+    if (!q.config.enabled) quotaEl.textContent = '每日限额未开启';
+    else if (!q.healthy || !qs) quotaEl.textContent = '计时器未运行，请检查后台任务';
+    else if (qs.error || (qs.closeFailures || []).length) quotaEl.textContent = '额度计时或关闭程序异常，请检查后台任务';
+    else quotaEl.textContent = '计时器正常 · 按各格子的独立或共享额度执行';
+  } else quotaEl.textContent = '额度读取失败';
+  // 跨设备状态先落下来：用量行要按池子的合计来显示
+  if (lan.status === 'fulfilled' && lan.value) renderLan(lan.value);
+  renderQuotaUsage(quota.status === 'fulfilled' ? quota.value : null);
 
   if (c.status === "fulfilled" && c.value && c.value.config) {
     cfg = c.value.config;
@@ -1719,7 +2079,7 @@ function renderSchedule() {
       const fw = ((cfg.force || {}).weekdays || []).filter(x => x);
       const fwTxt = (!fw.length || fw.length >= 7) ? "每天" : fw.map(d => WD_CN[d]).join("、");
       ln.style.display = "";
-      ln.innerHTML = `🔒 <b>强制模式已开启</b>(强制星期: ${fwTxt}) — <b>「屏蔽星期」「屏蔽时段」已锁定, 无法修改</b>(防破戒: 改星期或时段会让强制模式当天失效)。「屏蔽网页 / 屏蔽进程 / 白名单」${tightenOnly() ? "<b>只能新增, 不能删减</b>(白名单方向相反, 只能减少不能新增): 收紧的改动先排队、到非屏蔽时段自动生效, 放宽的改动会被直接拒绝" : "可自由编辑, 保存后立即生效"}。想改星期或时段, 请先在上方「强制模式」卡片中<b>关闭强制模式</b>。`;
+      ln.innerHTML = `🔒 <b>强制模式已开启</b>(强制星期: ${fwTxt}) — <b>「屏蔽星期」「屏蔽时段」已锁定, 无法修改</b>(防破戒: 改星期或时段会让强制模式当天失效)。${tightenOnly() ? "当前在屏蔽时段内: 黑名单<b>只能新增, 不能删减</b>(新增先排队), 白名单<b>只进不出</b>(不能加也不能删), 放宽方向一律直接拒绝" : "当前不在屏蔽时段, 黑名单 / 白名单都可自由增删, 保存后立即生效"}。想改星期或时段, 请先在上方「强制模式」卡片中<b>关闭强制模式</b>。`;
     } else {
       ln.style.display = "none";
     }
@@ -1862,8 +2222,8 @@ function renderWhitelist() {
   setLocked("#addWlSiteBtn", ro);
   setLocked("#wlProcInput", ro);
   setLocked("#addWlProcBtn", ro);
-  renderList("#wlSiteList", cfg.whitelist.sites, "wlsite");
-  renderList("#wlProcList", cfg.whitelist.processes, "wlproc");
+  renderList("#wlSiteList", cfg.whitelist.sites, "wlsite", ro, "屏蔽时段内白名单只进不出: 不能删除, 想删请等时段结束");
+  renderList("#wlProcList", cfg.whitelist.processes, "wlproc", ro, "屏蔽时段内白名单只进不出: 不能删除, 想删请等时段结束");
   applyLockNote("#wlLockNote", locked, "「白名单」");
 }
 
@@ -2280,15 +2640,23 @@ function applyLockNote(sel, locked, what) {
   }
   el.className = "queue-note";
   const mine = pendingItemsFor(sel);
-  // 白名单方向与屏蔽名单相反: 加白名单 = 放宽, 删白名单 = 收紧
-  const shrink = (sel === "#wlLockNote");
-  const rule = shrink ? "只能减少, 不能新增" : "只能新增, 不能删减";
-  const why  = shrink ? "加入白名单等于变相放行" : "删掉屏蔽项等于放行";
-  let html = `🔒 <b>强制模式已开启</b> — ${what}<b>${rule}</b>`;
-  if (forceActiveNow) {
-    html += `(防破戒: ${why})。当前正在屏蔽时段内: 收紧方向的改动会<b>先排队</b>, 到非屏蔽时段自动生效; 放宽方向的改动会被<b>直接拒绝</b>。`;
+  let html;
+  if (sel === "#wlLockNote") {
+    // 白名单: 屏蔽时段内两个方向都锁死(加 = 变相放行, 删 = 收紧), 时段外自由增删
+    html = `🔒 <b>强制模式已开启</b> — 「白名单」在屏蔽时段内<b>只进不出: 不能新增, 也不能删除</b>`;
+    html += forceActiveNow
+      ? `;当前正在屏蔽时段内, 增删都会被<b>直接拒绝</b>, 想调整请等本时段结束后再操作。`
+      : `;当前不在屏蔽时段, 可自由增删, 保存后立即生效。`;
   } else {
-    html += `。当前不在屏蔽时段, 保存后<b>立即生效</b>。`;
+    // 屏蔽名单: 屏蔽时段内只能新增(可排队), 不能删减
+    const rule = "只能新增, 不能删减";
+    const why  = "删掉屏蔽项等于放行";
+    html = `🔒 <b>强制模式已开启</b> — ${what}<b>${rule}</b>`;
+    if (forceActiveNow) {
+      html += `(防破戒: ${why})。当前正在屏蔽时段内: 新增会<b>先排队</b>, 到非屏蔽时段自动生效; 删除会被<b>直接拒绝</b>。`;
+    } else {
+      html += `。当前不在屏蔽时段, 保存后<b>立即生效</b>。`;
+    }
   }
   if (mine.length) {
     html += `<div class="qbox"><b>⏳ 已排队 ${mine.length} 项:</b> ${mine.map(esc).join("、")}`
@@ -2367,6 +2735,7 @@ function activateTab(el) {
     const changed = !!(current && current !== target);
     document.querySelectorAll(".panel").forEach(x => x.classList.remove("active", "leaving"));
     if (target) { target.classList.add("active"); playPanelEnter(target); }
+    $(".main").classList.toggle("study-view", tab === "study");
     if (tab === "study") mountStudyFrame();
     if (changed) { const m = $(".main"); if (m) m.scrollTop = 0; }
   };
@@ -2427,8 +2796,8 @@ navItems().forEach(el => {
 /* 深链: #study 之类刷新后停在同一个页签(也方便截图/排查) */
 (() => {
   const want = (location.hash || "").replace("#", "");
-  if (!want) return;
-  const el = document.querySelector('.nav-item[data-tab="' + want + '"]');
+  const el = navItems().find(item => item.dataset.tab === want)
+    || document.querySelector('.nav-item[data-tab="study"]');
   if (el) activateTab(el);
 })();
 
@@ -2660,7 +3029,7 @@ $("#sitePresets").addEventListener("click", e => {
   const all = p.domains;
   const present = all.filter(d => cfg.blockedSites.includes(d));
   if (present.length === all.length) {
-    // 取消勾选 = 把这些域名从屏蔽名单里删掉 = 放宽, 生效时段内拒绝
+    // 取消勾选 = 把这些域名从屏蔽名单里删掉 = 放宽, 屏蔽时段内拒绝
     if (tightenOnly()) { tightenToast("「屏蔽网页」域名", "取消勾选等于删掉这些域名"); return; }
     cfg.blockedSites = cfg.blockedSites.filter(d => !all.includes(d));
   } else {
@@ -2680,7 +3049,7 @@ $("#procPresets").addEventListener("click", e => {
   const hasItem = d => cfg.blockedProcesses.some(x => String(x).toLowerCase() === String(d).toLowerCase());
   const present = all.filter(d => hasItem(d));
   if (present.length === all.length) {
-    // 取消勾选 = 把这些进程从屏蔽名单里删掉 = 放宽, 生效时段内拒绝
+    // 取消勾选 = 把这些进程从屏蔽名单里删掉 = 放宽, 屏蔽时段内拒绝
     if (tightenOnly()) { tightenToast("「屏蔽进程」", "取消勾选等于删掉这些进程"); return; }
     cfg.blockedProcesses = cfg.blockedProcesses.filter(x => !all.some(d => String(x).toLowerCase() === String(d).toLowerCase()));
   } else {
@@ -2729,9 +3098,10 @@ document.addEventListener("click", e => {
   const btn = e.target.closest(".del-item");
   if (!btn) return;
   const { kind, v } = btn.dataset;
-  // 屏蔽名单的删除 = 放宽, 生效时段内拒绝(按钮已禁用, 这里再守一道, 防止绕过 disabled 强行点击)
-  if (SHIELD_KIND[kind] && tightenOnly()) {
-    tightenToast(SHIELD_KIND[kind], "删掉就等于放行");
+  // 删除 = 放宽: 屏蔽时段内一律拒绝 (黑名单删项 / 白名单删项), 时段外可自由删除
+  if (tightenOnly()) {
+    const what = (kind === "wlsite" || kind === "wlproc") ? "「白名单」" : (SHIELD_KIND[kind] || "名单");
+    tightenToast(what, "删掉一条就等于放行一点");
     return;
   }
   const lists = { site: cfg.blockedSites, proc: cfg.blockedProcesses, wlsite: cfg.whitelist.sites, wlproc: cfg.whitelist.processes, bwin: cfg.browser.windows };

@@ -27,6 +27,8 @@ if (-not $isAdmin) {
 }
 
 . "$PSScriptRoot\core.ps1"
+. "$PSScriptRoot\quota-rules.ps1"
+. "$PSScriptRoot\quota-ledger.ps1"
 
 $cfg = Get-AfsConfig
 if ($Port -eq 0) { $Port = $cfg.web.port }
@@ -79,6 +81,7 @@ function Read-AfsStudyStore {
 function Save-AfsStudyStore {
     param($Store)
     Write-AfsTextAtomic -Path $script:StudyDbPath -Text (ConvertTo-Json $Store -Depth 12)
+    try { Invoke-AfsStudySync | Out-Null } catch { }
 }
 
 # 页面写记录时字段带类型({ 总量: { number: 20 } }), 本地库只存裸值
@@ -100,6 +103,81 @@ function Get-AfsStudyTable {
 }
 
 # ---------------- 状态 ----------------
+
+# ---------------- 跨设备共享额度 ----------------
+
+# 手机上要填的就是这几个地址：只给非回环的 IPv4，虚拟网卡也照给 —— 用户自己认识哪个是家里 WiFi。
+function Get-AfsLanAddresses {
+    try {
+        @([System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
+            Where-Object { $_.AddressFamily -eq 'InterNetwork' -and -not [System.Net.IPAddress]::IsLoopback($_) } |
+            ForEach-Object { $_.IPAddressToString })
+    } catch { @() }
+}
+
+function Test-AfsLanListening {
+    param([int]$Port)
+    try { return (@(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop).Count -gt 0) } catch { }
+    $probe = New-Object System.Net.Sockets.TcpClient
+    try {
+        $probe.Connect('127.0.0.1', $Port)
+        return $true
+    } catch { return $false } finally { try { $probe.Dispose() } catch { } }
+}
+
+# 端口/令牌都是监听进程启动时读进变量的，改完必须换一个进程。
+# 只杀命令行里明确带 quota-lan.ps1 的 powershell，不碰面板自己和别的任务。
+function Stop-AfsQuotaLanHost {
+    try {
+        $targets = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Stop |
+            Where-Object { $_.CommandLine -and $_.CommandLine -like '*quota-lan.ps1*' -and $_.ProcessId -ne $PID })
+        foreach ($t in $targets) { try { Stop-Process -Id $t.ProcessId -Force -ErrorAction Stop } catch { } }
+    } catch { }
+}
+
+function Start-AfsQuotaLanHost {
+    param([int]$Port)
+    if (Test-AfsLanListening -Port $Port) { return $true }
+    $lanScript = Join-Path $PSScriptRoot 'quota-lan.ps1'
+    if (-not (Test-Path -LiteralPath $lanScript)) { return $false }
+    try {
+        # 隐藏窗口 + Hidden 参数：这条链路上任何一次闪黑框用户都会立刻发现
+        Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ('"' + $lanScript + '"')
+        ) | Out-Null
+        return $true
+    } catch { return $false }
+}
+
+# 面板侧的一份完整视图：配置 + 池子 + 本机地址 + 监听状态 + 共享规则。
+function Get-AfsQuotaLanView {
+    $cfg = Get-AfsQuotaLanConfig $PSScriptRoot
+    $now = Get-Date
+    $qcPath = Join-Path $PSScriptRoot 'game-quota-config.json'
+    $sharedId = ''
+    try {
+        if (Test-Path -LiteralPath $qcPath) {
+            $qc = ConvertTo-AfsAppQuotaConfig (Read-AfsJson $qcPath)
+            foreach ($r in $qc.rules) {
+                if ($r.ContainsKey('shared') -and [bool]$r.shared) { $sharedId = [string]$r.id }
+            }
+        }
+    } catch { }
+    @{
+        ok         = $true
+        config     = @{
+            enabled     = [bool]$cfg.enabled
+            port        = [int]$cfg.port
+            token       = [string]$cfg.token
+            poolMinutes = [int]$cfg.poolMinutes
+        }
+        view       = (Get-AfsQuotaPoolView -DataDir $PSScriptRoot -Now $now)
+        addresses  = @(Get-AfsLanAddresses)
+        listening  = (Test-AfsLanListening -Port ([int]$cfg.port))
+        sharedRule = $sharedId
+        editWindow = (Get-AfsQuotaEditWindow)
+    }
+}
 
 function Get-AfsStatusObj {
     $cfg = Get-AfsConfig
@@ -140,6 +218,7 @@ function Get-AfsStatusObj {
 $handler = {
     param($client)
     $stream = $null
+    $studyLock = $null
     $ErrorActionPreference = 'Continue'   # 路由里用显式 throw, 不依赖全局 Stop
     try {
         $stream = $client.GetStream()
@@ -185,6 +264,17 @@ $handler = {
         $path   = if ($parts.Count -gt 1) { $parts[1] } else { '/' }
         if ($path -match '\?') { $path = $path.Substring(0, $path.IndexOf('?')) }
 
+        if ($path.StartsWith('/api/study/db/')) {
+            $deadline = (Get-Date).AddSeconds(10)
+            while ($null -eq $studyLock) {
+                try { $studyLock = [System.IO.File]::Open(($script:StudyDbPath + '.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
+                catch {
+                    if ((Get-Date) -gt $deadline) { throw '学习台正在同步，请稍后重试' }
+                    Start-Sleep -Milliseconds 50
+                }
+            }
+        }
+
         $appDir = Split-Path (Get-AfsConfigPath)
         $logPath = Join-Path $appDir 'last-run.json'
 
@@ -204,6 +294,145 @@ $handler = {
                 forceActive = (Test-AfsForceActive -Config $cfgNow).active
                 pending     = (Read-AfsPendingQueue)
             }
+            return
+        }
+        if ($method -eq 'GET' -and $path -eq '/api/quota-lan') {
+            try {
+                Send-AfsJson -Stream $stream -Status 200 -Obj (Get-AfsQuotaLanView)
+            } catch {
+                Send-AfsJson -Stream $stream -Status 500 -Obj @{ ok = $false; error = $_.Exception.Message }
+            }
+            return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/quota-lan') {
+            try {
+                $editWindow = Get-AfsQuotaEditWindow
+                $cur = Get-AfsQuotaLanConfig $PSScriptRoot
+                $o = $body | ConvertFrom-Json -ErrorAction Stop
+                $next = @{ enabled = $cur.enabled; port = $cur.port; token = $cur.token; poolMinutes = $cur.poolMinutes }
+                if ($null -ne $o.enabled) { $next.enabled = [bool]$o.enabled }
+                if ($null -ne $o.port) {
+                    $port = 0
+                    if (-not [int]::TryParse([string]$o.port, [ref]$port) -or $port -lt 1024 -or $port -gt 65535) {
+                        throw '端口请填 1024 到 65535 之间的整数'
+                    }
+                    $next.port = $port
+                }
+                if ($null -ne $o.poolMinutes) {
+                    $minutes = 0
+                    if (-not [int]::TryParse([string]$o.poolMinutes, [ref]$minutes) -or $minutes -lt 1 -or $minutes -gt 1440) {
+                        throw '池子上限请填 1 到 1440 的整数分钟（有共享格子时以格子为准）'
+                    }
+                    $next.poolMinutes = $minutes
+                }
+                if ($o.PSObject.Properties.Name -contains 'token' -and $null -ne $o.token) {
+                    $next.token = ([string]$o.token).Trim()
+                }
+                if ($o.PSObject.Properties.Name -contains 'regenerateToken' -and [bool]$o.regenerateToken) {
+                    $next.token = New-AfsQuotaLanToken
+                }
+                if ($next.token -and $next.token -notmatch '^[A-Za-z0-9_-]{8,64}$') {
+                    throw '令牌只能是 8–64 位字母、数字、下划线或减号'
+                }
+                # 停用 / 换令牌 / 换端口 都等于把手机挡在门外 —— 少报的那部分用量会变成
+                # 电脑单边可用的时间，所以和「调小额度」同级，只在编辑时段开放。
+                if (-not $editWindow.allowed) {
+                    if ($cur.enabled -and -not $next.enabled) {
+                        throw ('停用跨设备共享会让手机那边的用量不再计入，只在每天 21:00–21:59 开放。下次 ' +
+                            ([datetime]$editWindow.next).ToString('MM-dd HH:mm'))
+                    }
+                    if ($next.enabled -and $cur.token -and $next.token -ne $cur.token) {
+                        throw '换令牌等于断开手机，只在每天 21:00–21:59 开放'
+                    }
+                    if ($next.enabled -and $cur.enabled -and $next.port -ne $cur.port) {
+                        throw '换端口等于断开手机，只在每天 21:00–21:59 开放'
+                    }
+                }
+                if ($next.enabled -and -not $next.token) { $next.token = New-AfsQuotaLanToken }
+                Save-AfsQuotaLanConfig -DataDir $PSScriptRoot -Config $next
+                # 端口 / 令牌 / 启用状态都是监听进程启动时读的，改完换一个进程
+                if ([int]$next.port -ne [int]$cur.port) {
+                    Stop-AfsQuotaLanHost
+                    Start-Sleep -Milliseconds 400
+                }
+                if ($next.enabled) { Start-AfsQuotaLanHost -Port ([int]$next.port) | Out-Null } else { Stop-AfsQuotaLanHost }
+                $view = Get-AfsQuotaLanView
+                $view.note = if ($next.enabled) { '已保存，手机端下次轮询即可连上' } else { '已停用跨设备共享' }
+                Send-AfsJson -Stream $stream -Status 200 -Obj $view
+            } catch {
+                Send-AfsJson -Stream $stream -Status 400 -Obj @{ ok = $false; error = $_.Exception.Message }
+            }
+            return
+        }
+        if ($method -eq 'GET' -and $path -eq '/api/game-quota') {
+            $qcPath = Join-Path $PSScriptRoot 'game-quota-config.json'
+            $qsPath = Join-Path $PSScriptRoot 'game-quota-state.json'
+            $qc = @{enabled=$false; dailyMinutes=120}
+            if (Test-Path $qcPath) { $qc = Read-AfsJson $qcPath }
+            $qc = ConvertTo-AfsAppQuotaConfig $qc
+            $qs = $null
+            if (Test-Path $qsPath) { $qs = Read-AfsAppQuotaState $qsPath (Get-Date) }
+            $healthy = $false
+            if ($qs -and $qs.updatedAt) {
+                $age = ((Get-Date) - [datetime]$qs.updatedAt).TotalSeconds
+                $healthy = ($age -ge 0 -and $age -lt 10)
+            }
+            if ($qs) {
+                $lastUpdate = $qs.updatedAt
+                $qs = Update-AfsAppQuotaState $qs $qc (Get-Date)
+                $qs.updatedAt = $lastUpdate
+            }
+            Send-AfsJson -Stream $stream -Status 200 -Obj @{ok=$true; config=$qc; state=$qs; healthy=$healthy; editWindow=(Get-AfsQuotaEditWindow)}
+            return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/game-quota') {
+            try {
+                $editWindow = Get-AfsQuotaEditWindow
+                $incoming = ConvertTo-AfsHashtable (ConvertFrom-Json $body -ErrorAction Stop)
+                $qc = ConvertTo-AfsAppQuotaConfig $incoming
+                $qcPath = Join-Path $PSScriptRoot 'game-quota-config.json'
+                # 跨设备共享标记（2026-11-02 起面板上有勾选了）：
+                #   · 前端显式带了 shared 字段 → 以它为准，用户想关就关；
+                #   · 前端一个字没提（旧缓存页面 / 旧版客户端）→ 按 id 从原配置继承。
+                # 不继承的后果很隐蔽：只是改了个分钟数，共享就悄悄断了，两边都看不出原因。
+                $mentionsShared = $false
+                foreach ($r in @($incoming.rules)) {
+                    if ($null -ne $r -and $r -is [hashtable] -and $r.ContainsKey('shared')) { $mentionsShared = $true; break }
+                }
+                if (-not $mentionsShared -and (Test-Path $qcPath)) {
+                    try {
+                        $prevQc = ConvertTo-AfsAppQuotaConfig (Read-AfsJson $qcPath)
+                        $sharedIds = @($prevQc.rules | Where-Object { $_.ContainsKey('shared') -and [bool]$_.shared } | ForEach-Object { [string]$_.id })
+                        if ($sharedIds.Count -gt 0) {
+                            foreach ($rule in $qc.rules) {
+                                if ([string]$rule.id -in $sharedIds) { $rule.shared = $true }
+                            }
+                        }
+                    } catch { }
+                }
+                if (-not $editWindow.allowed) {
+                    # 规定时间以外: 应用和进程「只进不出」—— 只能加, 不能删/降时长/关开关
+                    $curQc = $null
+                    if (Test-Path $qcPath) { $curQc = ConvertTo-AfsAppQuotaConfig (Read-AfsJson $qcPath) }
+                    $blockedByAppendOnly = Test-AfsQuotaAppendOnly -Current $curQc -Incoming $qc
+                    if ($blockedByAppendOnly) { throw $blockedByAppendOnly }
+                }
+                Write-AfsJson $qcPath $qc
+                Send-AfsJson -Stream $stream -Status 200 -Obj @{
+                    ok = $true; config = $qc; editWindow = $editWindow
+                    note = if ($editWindow.allowed) { '已保存' } else { '已在规定时间外按「只进不出」保存: 只新增了应用 / 共享格子成员' }
+                }
+                return
+            } catch {
+                Send-AfsJson -Stream $stream -Status 400 -Obj @{ ok = $false; error = $_.Exception.Message }
+                return
+            }
+        }
+        if ($method -eq 'GET' -and $path -eq '/api/quota-apps') {
+            $apps = @(Get-Process | Where-Object { $_.MainWindowTitle -and $_.Id -ne $PID } | ForEach-Object {
+                @{name=$_.ProcessName; title=$_.MainWindowTitle}
+            } | Sort-Object { $_.name } -Unique)
+            Send-AfsJson -Stream $stream -Status 200 -Obj @{ok=$true; apps=$apps}
             return
         }
         if ($method -eq 'GET' -and $path -eq '/api/status') {
@@ -228,12 +457,8 @@ $handler = {
                 if ($forceNow.active -and -not [bool]$inCfg.enabled) {
                     throw "强制模式生效中 (可先关闭强制模式, 再关闭屏蔽)"
                 }
-                # 强制模式开启期间:
-                #   「屏蔽星期 / 屏蔽时段」-> 硬拒 (它们正是"何时算非屏蔽时段"的定义, 改了就绕开强制)
-                #   「放宽」类(删屏蔽项 / 关屏蔽开关 / 往白名单加项) -> 生效时段内硬拒 (只能增不能删, 删了就是放行)
-                #   「收紧」类(加屏蔽项 / 开屏蔽开关 / 从白名单删项) -> 立即落地生效 (只收紧, 无放行风险),
-                #     合并进 config 后马上踢一次屏蔽引擎, 不再等本次时段结束。
-                #   判据集中在 core.ps1 的 Get-AfsConfigLockDiff (可离线回归测试)。
+                # 屏蔽时段的锁只在"强制模式开启"时生效 (防破戒);
+                # 强制模式关闭 / 非屏蔽时段: 黑名单和白名单都可以自由增删, 不做任何拦截。
                 if ([bool]$curCfg.force.enabled) {
                     $diff = Get-AfsConfigLockDiff -Current $curCfg -Incoming $inCfg
                     if ($diff.hardMsg) { throw $diff.hardMsg }
@@ -593,6 +818,7 @@ $handler = {
                 $table = Get-AfsStudyTable ([string]$q.table)
                 $store = Read-AfsStudyStore
                 $rows = @($store[$table])
+                if ($table -eq 'goals' -and -not $q.includeArchived) { $rows = @($rows | Where-Object { -not $_['已归档'] }) }
                 if ($table -eq 'focus') {
                     # 专注记录由 sync_activity.py 每 15 分钟从 activity.json 生成，本地优先
                     $fp = Join-Path ([System.IO.Path]::GetDirectoryName($script:StudyDbPath)) 'focus-local.json'
@@ -671,6 +897,7 @@ $handler = {
     } catch {
         try { Send-AfsResponse -Stream $stream -Status 500 -Type 'text/plain; charset=utf-8' -Body ("server error: " + $_.Exception.Message) } catch { }
     } finally {
+        if ($studyLock) { $studyLock.Dispose() }
         if ($client) { try { $client.Close() } catch { } }
     }
 }
@@ -712,7 +939,7 @@ while (-not $script:AFS_STOP) {
         }
         # 学习联动: 每 15 分钟把使用统计同步到云端 + 刷新今日打卡进度(study.flag)。
         # 独立进程跑, 不阻塞面板响应; 失败只影响数据新鲜度, 不影响屏蔽。
-        if (($nowSec - $script:AFS_LAST_STUDY) -ge 900) {
+        if (($nowSec - $script:AFS_LAST_STUDY) -ge 60) {
             $script:AFS_LAST_STUDY = $nowSec
             try { Invoke-AfsStudySync | Out-Null } catch { }
         }

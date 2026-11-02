@@ -1,4 +1,4 @@
-# LAN endpoint that lets the phone share the PC quota pool (and only that).
+﻿# LAN endpoint that lets the phone share the PC quota pool (and only that).
 #
 # Why TCP instead of HttpListener: HttpListener needs a URL ACL reservation for
 # a non-admin account, and this app runs from a scheduled task under the normal
@@ -214,18 +214,35 @@ while ($true) {
         if ($req.method -eq 'POST') {
             $used = -1.0
             $group = ''
+            $apps = @()
+            $hasApps = $false
             if ($req.body) {
                 try {
                     $o = $req.body | ConvertFrom-Json -ErrorAction Stop
                     if ($null -ne $o.usedSeconds) { [void][double]::TryParse([string]$o.usedSeconds, [ref]$used) }
                     if ($null -ne $o.group) { $group = [string]$o.group }
+                    # Per-app slice: display-only, so a malformed entry is skipped
+                    # rather than rejecting the whole report.
+                    if ($null -ne $o.apps) {
+                        $hasApps = $true
+                        foreach ($a in @($o.apps)) {
+                            if ($null -eq $a) { continue }
+                            $apps += @{ name = [string]$a.name; seconds = [string]$a.seconds }
+                            if ($apps.Count -ge 30) { break }
+                        }
+                    }
                 } catch { }
             }
             if ($used -ge 0 -and -not [double]::IsNaN($used) -and $used -le 86400) {
                 # 2s coalescing: the phone polls every 3s, but a sticky network can
                 # retry in a burst and write the same number five times.
                 if (([Math]::Abs($used - $lastPhoneUsed) -gt 0.4) -or (($now - $lastPhoneWrite).TotalSeconds -ge 2)) {
-                    Write-AfsQuotaLanState -DataDir $DataDir -Now $now -PhoneUsedSeconds $used -PhoneGroup $group
+                    # 旧版手机只报总数（body 里没有 apps）：沿用上一次的明细，
+                    # 否则升级前攒下的「哪个应用花了多少」会被每次轮询清空。
+                    if (-not $hasApps) {
+                        $apps = @((Read-AfsQuotaLanState -DataDir $DataDir -Now $now).phoneApps)
+                    }
+                    Write-AfsQuotaLanState -DataDir $DataDir -Now $now -PhoneUsedSeconds $used -PhoneGroup $group -PhoneApps $apps
                     $lastPhoneWrite = $now
                     $lastPhoneUsed = $used
                 }

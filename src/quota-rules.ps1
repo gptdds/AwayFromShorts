@@ -149,6 +149,10 @@ function Test-AfsQuotaAppendOnly {
         if ([int]$b.dailyMinutes -ne [int]$a.dailyMinutes) {
             return ('规定时间以外不能改每日时长: ' + $a.name + ' (' + [int]$a.dailyMinutes + ' → ' + [int]$b.dailyMinutes + ' 分钟)。想改请等每天 21:00–21:59。')
         }
+        # 关掉共享 = 把手机那半边已经用掉的时间从账上放走, 和调大额度是同一类事。
+        if ($a.ContainsKey('shared') -and [bool]$a.shared -and -not ($b.ContainsKey('shared') -and [bool]$b.shared)) {
+            return ('规定时间以外不能关掉跨设备共享: ' + $a.name + '。关掉等于把手机那边的用量放走, 想改请等每天 21:00–21:59。')
+        }
         $oldProcs = @($a.processes | Where-Object { $_ })
         $newProcs = @($b.processes | Where-Object { $_ })
         foreach ($p in $oldProcs) {

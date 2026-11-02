@@ -160,6 +160,8 @@ try {
                 total     = [Math]::Round([double]$view.total, 1)
                 remaining = [Math]::Round([double]$view.remaining, 1)
                 exhausted = [bool]$view.exhausted
+                # 电脑那半边的进程明细：手机离线时也能看到"是哪个游戏在吃时间"。
+                pcApps    = @($view.pcApps | ForEach-Object { @{ name = [string]$_.name; seconds = [Math]::Round([double]$_.seconds, 1) } })
                 updated   = (Get-Date -Format 'o')
             }
             $files['quota-pool.json'] = @{ content = ($pool | ConvertTo-Json -Compress -Depth 4) }
