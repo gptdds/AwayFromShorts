@@ -78,7 +78,7 @@ function Save-AfsQuotaLanConfig {
 function Read-AfsQuotaLanState {
     param([string]$DataDir, [datetime]$Now)
     $path = Get-AfsQuotaLanStatePath $DataDir
-    $today = $Now.ToString('yyyy-MM-dd')
+    $today = Get-AfsQuotaDayKey $Now
     $state = @{ date = $today; phoneUsedSeconds = 0.0; phoneGroup = ''; phoneApps = @(); updatedAt = '' }
     if (-not (Test-Path -LiteralPath $path)) { return $state }
     try {
@@ -125,7 +125,7 @@ function Write-AfsQuotaLanState {
         if ($apps.Count -ge 30) { break }
     }
     Write-AfsJson -Path (Get-AfsQuotaLanStatePath $DataDir) -Object @{
-        date             = $Now.ToString('yyyy-MM-dd')
+        date             = (Get-AfsQuotaDayKey $Now)
         phoneUsedSeconds = $used
         phoneGroup       = [string]$PhoneGroup
         phoneApps        = @($apps)
@@ -171,7 +171,7 @@ function Get-AfsQuotaPcSharedUsed {
     try {
         $cfg = Read-AfsJson -Path $gameCfgPath
         $state = Read-AfsJson -Path $statePath
-        if ([string]$state.date -ne $Now.ToString('yyyy-MM-dd')) { return @{ used = 0.0; minutes = 0; apps = @() } }
+        if ([string]$state.date -ne (Get-AfsQuotaDayKey $Now)) { return @{ used = 0.0; minutes = 0; apps = @() } }
         $entries = $state.apps
         foreach ($rule in @($cfg.rules)) {
             if ($null -eq $rule -or -not $rule.ContainsKey('shared') -or -not [bool]$rule.shared) { continue }
@@ -220,7 +220,7 @@ function Get-AfsQuotaPoolView {
     $pcUsed = [double]$pc.used
     $total = $pcUsed + $phone
     @{
-        date        = $Now.ToString('yyyy-MM-dd')
+        date        = (Get-AfsQuotaDayKey $Now)
         enabled     = [bool]$cfg.enabled
         poolMinutes = $minutes
         limitSec    = $limit

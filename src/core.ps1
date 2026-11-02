@@ -10,10 +10,36 @@ $script:AFS_MARK_START  = "# >>> $($script:AFS_NAME) >>> (managed by AwayFromSho
 $script:AFS_MARK_END    = "# <<< $($script:AFS_NAME) <<<"
 # 这些进程永远不杀,防止把系统/本工具自己弄死
 $script:AFS_PROTECTED   = @('powershell','pwsh','conhost','wininit','winlogon','csrss','services','lsass','smss','system','svchost','explorer')
+# 额度日从几点开始（2026-11-02 用户要求：统一早上 8 点）。
+# 手机端 DayBoundary.DEFAULT_HOUR 必须与它一致 —— 两边不一致时，跨设备共享的
+# 「今天」会在凌晨 0:00–8:00 错开，池子就会一边已清零、另一边还在算昨天。
+$script:AFS_QUOTA_RESET_HOUR = 8
 $script:AFS_LOCK_PATH   = Join-Path $env:TEMP "$($script:AFS_NAME).lock"
 $script:AfsConfigPath   = $null   # 由 enforcer / webui 覆盖
 
 function Set-AfsConfigPath { param([string]$Path) $script:AfsConfigPath = $Path }
+
+# ---------------- 额度日（统一早上 8 点） ----------------
+# 额度账本的「今天」不是墙上时间的今天：早上 8 点之前仍然算前一天，
+# 这样熬夜到凌晨不会因为过了 0 点就白拿一份新额度。
+function Get-AfsQuotaDayStart {
+    param([datetime]$Now = (Get-Date))
+    $start = $Now.Date.AddHours([int]$script:AFS_QUOTA_RESET_HOUR)
+    if ($Now -lt $start) { $start = $start.AddDays(-1) }
+    $start
+}
+
+function Get-AfsQuotaDayKey {
+    param([datetime]$Now = (Get-Date))
+    (Get-AfsQuotaDayStart $Now).ToString('yyyy-MM-dd')
+}
+
+# 自额度日起点过了多少秒。跨日那一 tick 的 elapsed 必须用它截断，
+# 否则会把 8 点之前的那段时间算进新的一天。
+function Get-AfsQuotaDaySeconds {
+    param([datetime]$Now = (Get-Date))
+    [Math]::Max(0.0, ($Now - (Get-AfsQuotaDayStart $Now)).TotalSeconds)
+}
 
 function Get-AfsConfigPath {
     if ($script:AfsConfigPath) { return $script:AfsConfigPath }
@@ -288,9 +314,10 @@ function Get-AfsListRemoved {
 }
 
 # 强制模式开启期间, 把配置改动分成三类 (防破戒):
-#   硬拒 hard  : 屏蔽星期 / 屏蔽时段 —— "什么时候算非屏蔽时段"正是由它们定义, 参与排队会让排队规则自己失效
-#   放宽 widen : 删掉屏蔽项 / 关掉屏蔽开关 / 往白名单里加项 —— 都是"直接放行", 生效时段内一律拒绝 (只能收紧, 不能放宽)
-#   可排队 queue: 新增屏蔽项 / 打开屏蔽开关 / 从白名单删项 —— 方向是"更严", 生效时段内保存时立即写入 config
+#   硬拒 hard  : 屏蔽星期 / 屏蔽时段 / 强制模式本体 —— 它们定义"何时算屏蔽时段", 改了就等于绕开强制
+#   放宽 widen : 屏蔽时段内删黑名单 / 加白名单 / 删白名单 / 关掉屏蔽开关 —— 都是"直接放行", 一律拒绝
+#                (名单在屏蔽时段内「只进不出」: 只能加, 不能删; 非屏蔽时段可自由增删)
+#   可排队 queue: 新增屏蔽项 / 打开屏蔽开关 —— 方向是"更严", 保存时立即写入 config
 #                (只收紧无放行风险, 引擎常规 tick 自动应用; 急用走面板「立即应用」人工触发)
 # 返回 @{ any; hardKeys; hardMsg; widenKeys; widenLabels; widenMsg; queueKeys; queueLabels; queueMsg }
 # 抽成独立函数是为了能脱离 HTTP 服务做离线回归测试。
@@ -352,7 +379,7 @@ function Get-AfsConfigLockDiff {
     if ($rmSites.Count -gt 0) {
         [void]$widenKeys.Add('sites'); [void]$widenLabels.Add('「屏蔽网页」域名')
         if (-not $widenMsg) {
-            $widenMsg = '强制模式生效中, 屏蔽网页名单「只能新增, 不能删减」—— 无法删除域名: ' + ($rmSites -join '、') + ' (删掉就等于放行)。本次改动已整体拒绝, 想删请等当前屏蔽时段结束后再操作。'
+            $widenMsg = '屏蔽时段内, 屏蔽网页名单「只能新增, 不能删减」—— 无法删除域名: ' + ($rmSites -join '、') + ' (删掉就等于放行)。本次改动已整体拒绝, 想删请等当前屏蔽时段结束后再操作。'
         }
     }
     if ($adSites.Count -gt 0) {
@@ -379,7 +406,7 @@ function Get-AfsConfigLockDiff {
     if ($rmWin.Count -gt 0) {
         [void]$widenKeys.Add('browserWindows'); [void]$widenLabels.Add('「屏蔽 Edge 工作区」名单')
         if (-not $widenMsg) {
-            $widenMsg = '强制模式生效中, Edge 工作区名单「只能新增, 不能删减」—— 无法删除工作区: ' + ($rmWin -join '、') + ' (删掉就等于放行)。'
+            $widenMsg = '屏蔽时段内, Edge 工作区名单「只能新增, 不能删减」—— 无法删除工作区: ' + ($rmWin -join '、') + ' (删掉就等于放行)。想删请等当前屏蔽时段结束后再操作。'
         }
     }
     if ($adWin.Count -gt 0) {
@@ -414,7 +441,7 @@ function Get-AfsConfigLockDiff {
     if ($rmProc.Count -gt 0) {
         [void]$widenKeys.Add('processes'); [void]$widenLabels.Add('「屏蔽进程」名单')
         if (-not $widenMsg) {
-            $widenMsg = '强制模式生效中, 屏蔽进程名单「只能新增, 不能删减」—— 无法删除进程: ' + ($rmProc -join '、') + ' (删掉就等于放行)。本次改动已整体拒绝, 想删请等当前屏蔽时段结束后再操作。'
+            $widenMsg = '屏蔽时段内, 屏蔽进程名单「只能新增, 不能删减」—— 无法删除进程: ' + ($rmProc -join '、') + ' (删掉就等于放行)。本次改动已整体拒绝, 想删请等当前屏蔽时段结束后再操作。'
         }
     }
     if ($adProc.Count -gt 0) {
@@ -430,8 +457,12 @@ function Get-AfsConfigLockDiff {
             $widenMsg = '强制模式生效中, 白名单「只能删减, 不能新增」—— 无法把域名加入白名单: ' + ($adWlS -join '、') + ' (加入白名单等于变相放行)。'
         }
     }
+    # 白名单「只进不出」: 屏蔽时段内删白名单同样是"放宽", 一律拒绝; 非屏蔽时段可自由删。
     if ($rmWlS.Count -gt 0) {
-        [void]$queueKeys.Add('wlSites'); [void]$queueLabels.Add('「白名单域名」')
+        [void]$widenKeys.Add('whitelist'); [void]$widenLabels.Add('「白名单域名」')
+        if (-not $widenMsg) {
+            $widenMsg = '屏蔽时段内, 白名单「只进不出」—— 无法删除白名单域名: ' + ($rmWlS -join '、') + '。想删请等当前屏蔽时段结束后再操作。'
+        }
     }
     $adWlP = @(Get-AfsListAdded   -Old ($Current.whitelist).processes -New ($Incoming.whitelist).processes)
     $rmWlP = @(Get-AfsListRemoved -Old ($Current.whitelist).processes -New ($Incoming.whitelist).processes)
@@ -441,8 +472,12 @@ function Get-AfsConfigLockDiff {
             $widenMsg = '强制模式生效中, 白名单「只能删减, 不能新增」—— 无法把进程加入白名单: ' + ($adWlP -join '、') + ' (加入白名单等于变相放行)。'
         }
     }
+    # 白名单「只进不出」: 同上, 屏蔽时段内不能删白名单进程
     if ($rmWlP.Count -gt 0) {
-        [void]$queueKeys.Add('wlProcs'); [void]$queueLabels.Add('「白名单进程」')
+        [void]$widenKeys.Add('whitelist'); [void]$widenLabels.Add('「白名单进程」')
+        if (-not $widenMsg) {
+            $widenMsg = '屏蔽时段内, 白名单「只进不出」—— 无法删除白名单进程: ' + ($rmWlP -join '、') + '。想删请等当前屏蔽时段结束后再操作。'
+        }
     }
 
     $res.hardKeys    = @($hardKeys)
@@ -1435,7 +1470,11 @@ function Get-AfsBrowserPolicySignature {
         -not ($bp.valid -and -not $bp.isPath -and $wlPlainHosts -contains $bp.host)
     })
     $all = @(ConvertTo-AfsUrlPatterns -Domains $toBlock) + @(ConvertTo-AfsUrlPatterns -Domains $wlSites)
-    $joined = (@($all | Sort-Object -Unique) -join "`n")
+    # 指纹必须包含目标浏览器列表: 只改 browser.targets(比如新加 chrome)时也要触发重写,
+    # 否则 Edge 的策略签名不变 → Chrome 永远拿不到 URLBlocklist。
+    $targets = @($Config.browser.targets | ForEach-Object { ([string]$_).Trim().ToLower() } |
+        Where-Object { $_ } | Sort-Object -Unique)
+    $joined = (@($all | Sort-Object -Unique) -join "`n") + "`n#targets:" + ($targets -join ',')
     $md5 = [System.Security.Cryptography.MD5]::Create()
     $hash = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($joined))
     (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
@@ -1532,7 +1571,7 @@ function Invoke-AfsBrowserWindowClose {
     # 只按用户配置的窗口标题(工作区名, 如"娱乐")关闭窗口 —— 刻意不做"标题含屏蔽站点名"兜底:
     # 那会把普通工作窗口(如在工作区看 B 站教程/知乎)一并误关; 导航层拦截由 urlBlock 负责。
     $payload = @{
-        patterns   = @($Config.browser.windows | Where-Object { $_ })
+        patterns   = @($Config.browser.windows | Where-Object { $Config.browser.enabled -and $_ })
         targets    = @($Config.browser.targets)
         restartAll = [bool]$RestartAll
     }
@@ -1692,11 +1731,7 @@ function Invoke-AfsEnforce {
             }
             if (-not $Simulate) {
                 $killList = Get-AfsProcessKillList -Config $Config
-                if ($Config.browser.enabled) {
-                    # 浏览器窗口(工作区)屏蔽生效: 浏览器不按进程强杀, 交给窗口关闭机制
-                    $browserNames = @($Config.browser.targets | ForEach-Object { if ($_ -eq 'edge') { 'msedge' } else { 'chrome' } })
-                    $killList = @($killList | Where-Object { $browserNames -notcontains $_ })
-                }
+                # 显式进程黑名单优先于窗口规则; 只有未列入黑名单的浏览器才按标题关闭。
                 $killed = New-Object System.Collections.Generic.List[string]
                 foreach ($n in $killList) {
                     foreach ($pr in @(Get-Process -Name $n -ErrorAction SilentlyContinue)) {
@@ -1710,7 +1745,7 @@ function Invoke-AfsEnforce {
             }
 
             # 浏览器窗口(工作区)屏蔽: 每分钟触发关闭匹配窗口 (用户重开也会再关)
-            if (-not $Simulate -and ($Config.browser.enabled -or $Config.browser.urlBlock)) {
+            if (-not $Simulate -and ($Config.browser.enabled -or $Config.browser.urlBlock -or @($killList | Where-Object { $_ -in @('chrome','msedge') }).Count -gt 0)) {
                 Invoke-AfsBrowserWindowClose -Config $Config
                 $log.browser = "window-block($(@($Config.browser.windows | Where-Object { $_ }).Count) patterns)"
             } elseif (-not $Simulate) {

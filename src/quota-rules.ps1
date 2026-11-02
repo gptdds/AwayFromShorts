@@ -211,10 +211,11 @@ function Get-AfsForegroundQuotaTarget {
 function Update-AfsAppQuotaState {
     param([hashtable]$State, [hashtable]$Config, [datetime]$Now, [double]$Elapsed=0, [string[]]$ForegroundIds=@(),
           [double]$SharedUsedSeconds=0, [int]$PoolMinutes=0)
-    $today=$Now.ToString('yyyy-MM-dd')
+    $today=Get-AfsQuotaDayKey $Now
     if ($State.date -ne $today) {
         $State=@{version=4;date=$today;targets=@{}}
-        $Elapsed=[Math]::Min($Elapsed,$Now.TimeOfDay.TotalSeconds)
+        # 只把额度日重置之后的那一段算进新的一天（重置在早上 8 点，不是零点）
+        $Elapsed=[Math]::Min($Elapsed,(Get-AfsQuotaDaySeconds $Now))
     }
     if (-not $State.ContainsKey('targets')) {
         $State.targets=@{}
@@ -271,7 +272,7 @@ function Update-AfsAppQuotaState {
 
 function Read-AfsAppQuotaState {
     param([string]$Path, [datetime]$Now)
-    if (-not (Test-Path -LiteralPath $Path)) { return @{version=4;date=$Now.ToString('yyyy-MM-dd');targets=@{}} }
+    if (-not (Test-Path -LiteralPath $Path)) { return @{version=4;date=(Get-AfsQuotaDayKey $Now);targets=@{}} }
     try {
         $state=Read-AfsJson $Path
         if ($state.date -notmatch '^\d{4}-\d{2}-\d{2}$') { throw 'Invalid date' }
@@ -287,5 +288,5 @@ function Read-AfsAppQuotaState {
             if ($null -eq $value -or [double]$value -lt 0 -or [double]::IsNaN([double]$value) -or [double]::IsInfinity([double]$value)) { throw 'Invalid usage' }
         }
         return $state
-    } catch { return @{version=4;date=$Now.ToString('yyyy-MM-dd');targets=@{};error='Quota state unreadable'} }
+    } catch { return @{version=4;date=(Get-AfsQuotaDayKey $Now);targets=@{};error='Quota state unreadable'} }
 }
