@@ -10,6 +10,11 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $log  = Join-Path $here 'study-gist.log'
 $stPath = Join-Path $here 'study-gist-state.json'
 
+# quota-ledger 需要 core.ps1 里的 Read-AfsJson / Write-AfsJson。core.ps1 只定义函数,
+# 加载它没有副作用（game-quota.ps1 也是这么用的）。
+. (Join-Path $here 'core.ps1')
+. (Join-Path $here 'quota-ledger.ps1')
+
 # 连续失败计数: 面板读这个文件亮角标。成功一次就清零。
 function Read-GateState {
     try {
@@ -137,6 +142,30 @@ try {
         }
     } catch {
         Write-Log 'WARN' ('ACTIVITY_SLICE_FAIL ' + $_.Exception.Message)
+    }
+
+    # ---------- 3.6 组 quota-pool.json（局域网连不上时手机端的兜底） ----------
+    # 局域网是主通道（3 秒）；Gist 只是手机不在家、或电脑那边服务没起来时的退路。
+    # 延迟最大 15 分钟，所以手机端拿它判超是偏乐观的 —— 但比「完全各自记账」强,
+    # 至少能看到电脑那边已经用掉多少。
+    try {
+        $lanCfg = Get-AfsQuotaLanConfig $here
+        if ($lanCfg.enabled) {
+            $view = Get-AfsQuotaPoolView -DataDir $here -Now (Get-Date)
+            $pool = [ordered]@{
+                date      = [string]$view.date
+                minutes   = [int]$view.poolMinutes
+                pcUsed    = [Math]::Round([double]$view.pcUsed, 1)
+                phoneUsed = [Math]::Round([double]$view.phoneUsed, 1)
+                total     = [Math]::Round([double]$view.total, 1)
+                remaining = [Math]::Round([double]$view.remaining, 1)
+                exhausted = [bool]$view.exhausted
+                updated   = (Get-Date -Format 'o')
+            }
+            $files['quota-pool.json'] = @{ content = ($pool | ConvertTo-Json -Compress -Depth 4) }
+        }
+    } catch {
+        Write-Log 'WARN' ('QUOTA_SLICE_FAIL ' + $_.Exception.Message)
     }
 
     # ---------- 4. PATCH Gist ----------
