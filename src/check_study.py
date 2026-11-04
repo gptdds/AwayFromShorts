@@ -7,12 +7,15 @@
      { "rev": n, "updated": "...",
        "goals": [ {id,name,unit,total,base,due} ],
        "recs":  [ {id,goalId,date,amount,ts} ] }
-  2. 拉不到 / 解析失败 -> 回退读 WorkBuddy 云资料库（老链路兜底）
-  3. 全都失败 -> fail-open：输出 error，调用方按"正常解锁"处理，绝不锁死
+  2. 拉不到 / 解析失败 -> fail-open：输出 error，调用方按"正常解锁"处理
+     （2026-10-24 起不再回退云端表，学习台已迁到 PC 本地）：输出 error，调用方按"正常解锁"处理，绝不锁死
 
 输出：
   stdout 一行 JSON，同时写 study.flag 给 watcher.ps1 读。
-  { "date": "...", "allDone": bool, "active": n, "pending": n, "pendingNames": [...] }
+  { "date": "...", "allDone": bool, "active": n, "pending": n, "pendingNames": [...],
+    "lastHitAt": "YYYY-MM-DD HH:MM" }
+  lastHitAt = 今天最后一笔打卡的本地时间(没有则空串)。PC 端 20:00 打卡罚时用它判
+  "是不是 20:00 之后才补的卡"，与手机端 CheckinPenalty.missed() 同口径。
 """
 
 from __future__ import annotations
@@ -20,19 +23,13 @@ from __future__ import annotations
 import json
 import math
 import os
-import subprocess
 import sys
-import tempfile
 import urllib.request
 from datetime import datetime
 
 PY = sys.executable
 # 面板（计划任务）拉起的进程没有这个变量，资料库脚本会退到另一套鉴权，
 # 读能过、写直接 E_AUTH_FAILED。这里补默认值，子进程继承。
-os.environ.setdefault("WORKBUDDY_CONFIG_DIR", os.path.join(os.path.expanduser("~"), ".workbuddy"))
-LIB = r"C:/Program Files/WorkBuddy/resources/app.asar.unpacked/resources/plugins/workbuddy-builtin/skills/library"
-DB_GOALS = "0bGK9KsEEiWn1pc5rpkt0x"
-DB_LOGS = "cfTvN9M6VSQCFyrGJrWM9Z"
 HERE = os.path.dirname(os.path.abspath(__file__))
 FLAG = os.path.join(HERE, "study.flag")
 
@@ -40,60 +37,10 @@ FLAG = os.path.join(HERE, "study.flag")
 LEDGER_FILE = "checkin-ledger.json"
 
 
-def call(payload: dict) -> dict:
-    script = os.path.join(LIB, "database", "query_database_record.py")
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-        tmp = f.name
-    # 面板进程的代码页可能是 936(GBK)，子进程默认按它输出 -> UTF-8 解码直接炸
-    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
-    try:
-        with open(tmp, "r", encoding="utf-8") as stdin:
-            p = subprocess.run([PY, script, "--stdin"], stdin=stdin, env=env,
-                               capture_output=True, text=True, encoding="utf-8",
-                               errors="replace", timeout=60)
-    finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-    out = (p.stdout or "").strip()
-    if not out:
-        raise RuntimeError((p.stderr or "empty output").strip()[:200])
-    return json.loads(out.splitlines()[-1])
-
-
-def fetch_all(database_id: str) -> list:
-    rows, cursor, guard = [], None, 0
-    while guard < 50:
-        guard += 1
-        payload = {"database_id": database_id, "page_size": 200}
-        if cursor:
-            payload["start_cursor"] = cursor
-        data = call(payload)
-        rows.extend(data.get("results") or [])
-        cursor = data.get("next_cursor") or data.get("nextCursor")
-        if not (data.get("has_more") or data.get("hasMore")) or not cursor:
-            break
-    return rows
-
-
-def scalar(v):
-    if isinstance(v, dict):
-        for k in ("text", "number", "date", "checkbox"):
-            if k in v:
-                return v[k]
-        return ""
-    return v if v is not None else ""
-
-
-def day_of(v) -> str:
-    s = str(scalar(v) or "")
-    return s[:10] if len(s) >= 10 else ""
-
-
 def days_left(deadline: str, today: str) -> int:
     """截止日到今天还有几天（已过期为负数，解析失败按 0 处理）。"""
+    if not deadline:
+        return 29  # No deadline: spread the remaining work over 30 days, like the phone.
     try:
         d = datetime.strptime(deadline[:10], "%Y-%m-%d").date()
         t = datetime.strptime(today[:10], "%Y-%m-%d").date()
@@ -118,11 +65,40 @@ def suggest_amount(remain: float, left: int) -> float:
     return round(raw * 10) / 10
 
 
+def scalar(v):
+    """云端表格字段带类型({text: ..}/{number: ..})，取裸值。本地库是裸值，直接返回。"""
+    if isinstance(v, dict):
+        for k in ("text", "number", "date", "checkbox"):
+            if k in v:
+                return v[k]
+        return ""
+    return v if v is not None else ""
+
+
 def number(v, default: float = 0.0) -> float:
     try:
         return float(scalar(v) or default)
     except (TypeError, ValueError):
         return default
+
+
+def hit_time(ts) -> str:
+    """毫秒时间戳 -> 本地 'YYYY-MM-DD HH:MM'；缺失/异常返回空串。
+
+    PC 端 20:00 打卡罚时要判「今天最后一笔卡是不是 20:00 之后才补的」,
+    和手机端 CheckinPenalty.missed() 同口径。时间戳来自本地库的「时间戳」
+    或 Gist 台账的 ts, 都是毫秒 epoch。
+    """
+    try:
+        v = float(scalar(ts) or 0)
+    except (TypeError, ValueError):
+        return ""
+    if v <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(v / 1000).strftime("%Y-%m-%d %H:%M")
+    except (OSError, OverflowError, ValueError):
+        return ""
 
 
 def gist_id() -> str:
@@ -173,6 +149,8 @@ def local_view():
 
     goals = []
     for g in store.get("goals") or []:
+        if g.get("已归档") or g.get("示例数据"):
+            continue
         gid = str(g.get("目标ID") or "")
         name = str(g.get("目标名称") or "")
         try:
@@ -183,10 +161,7 @@ def local_view():
             continue
         goals.append({"id": gid, "name": name,
                       "unit": str(g.get("单位") or "个"), "total": total,
-                      "base": number(g.get("已完成量")), "due": str(g.get("截止日") or "")})
-    if not goals:
-        return None
-
+                      "base": number(g.get("已完成量")), "daily": number(g.get("每日默认量")), "due": str(g.get("截止日") or "")})
     logs = []
     for r in store.get("logs") or []:
         rid = str(r.get("记录ID") or r.get("id") or "")
@@ -195,7 +170,8 @@ def local_view():
             continue
         logs.append({"id": rid, "goalId": gid,
                      "date": str(r.get("日期") or "")[:10],
-                     "amount": number(r.get("完成量"))})
+                     "amount": number(r.get("完成量")),
+                     "ts": number(r.get("时间戳"))})
     return goals, logs
 
 
@@ -228,7 +204,8 @@ def merge_ledger(goals: list, logs: list, ledger: dict) -> tuple:
             continue
         logs.append({"id": rid, "goalId": gid,
                      "date": str(r.get("date") or "")[:10],
-                     "amount": number(r.get("amount"))})
+                     "amount": number(r.get("amount")),
+                     "ts": number(r.get("ts"))})
         seen.add(rid)
     return goals, logs
 
@@ -236,7 +213,7 @@ def merge_ledger(goals: list, logs: list, ledger: dict) -> tuple:
 def main() -> int:
     today = datetime.now().strftime("%Y-%m-%d")
     result = {"date": today, "allDone": True, "active": 0, "pending": 0,
-              "pendingNames": [], "goals": [],
+              "pendingNames": [], "goals": [], "lastHitAt": "",
               "checkedAt": datetime.now().strftime("%Y-%m-%d %H:%M")}
     pending_names = []
     try:
@@ -245,22 +222,21 @@ def main() -> int:
         if local is not None:
             src = "local"
             goals_raw, logs_raw = local
-            if ledger is not None:
-                goals_raw, logs_raw = merge_ledger(goals_raw, logs_raw, ledger)
         elif ledger is not None:
             src = "hub"
-            goals_raw = ledger.get("goals") or []
+            goals_raw = [g for g in ledger.get("goals", []) if not g.get("archived")]
             logs_raw = ledger.get("recs") or []
         else:
-            src = "cloud-fallback"
-            goals_raw = fetch_all(DB_GOALS)
-            logs_raw = fetch_all(DB_LOGS)
+            # 本地库和台账都拿不到 -> fail-open，交给外层 except 输出 error
+            raise RuntimeError("本地库与 Gist 台账都不可用")
         result["source"] = src
 
         if src in ("hub", "local"):
             # 本地库 / 台账都是明文键（goalId / amount / date），走的同一套统计
             done_by_goal = {}
             today_hit = set()
+            now_ms = datetime.now().timestamp() * 1000
+            last_hit_ms = 0.0
             for r in logs_raw:
                 gid = str(r.get("goalId") or "")
                 if not gid:
@@ -272,6 +248,11 @@ def main() -> int:
                 done_by_goal[gid] = done_by_goal.get(gid, 0.0) + amount
                 if str(r.get("date") or "")[:10] == today:
                     today_hit.add(gid)
+                    ts = number(r.get("ts"))
+                    # 未来的时间戳(补记/时钟回拨)不参与"20:00 之后补卡"的判定
+                    if 0 < ts <= now_ms:
+                        last_hit_ms = max(last_hit_ms, ts)
+            result["lastHitAt"] = hit_time(last_hit_ms)
 
             for g in goals_raw:
                 gid = str(g.get("id") or "")
@@ -294,58 +275,16 @@ def main() -> int:
                     "total": round(total, 2),
                     "done": round(done, 2),
                     "todayHit": hit,
-                    "suggest": suggest_amount(total - done,
+                    "suggest": number(g.get("daily")) if 0 < number(g.get("daily")) <= 1e12 else suggest_amount(total - done,
                                               days_left(str(g.get("due") or ""), today)),
                 })
                 if not hit:
                     pending_names.append(name)
-        else:
-            # 老链路：云资料库的表格字段（记录ID/目标ID/日期/完成量...）
-            done_by_goal = {}
-            today_hit = set()
-            for r in logs_raw:
-                gid = str(scalar(r.get("目标ID")) or "")
-                if not gid:
-                    continue
-                amount = number(r.get("完成量"))
-                done_by_goal[gid] = done_by_goal.get(gid, 0.0) + amount
-                if day_of(r.get("日期")) == today:
-                    today_hit.add(gid)
-
-            for g in goals_raw:
-                gid = str(scalar(g.get("目标ID")) or "")
-                name = str(scalar(g.get("目标名称")) or "")
-                if not gid or not name:
-                    continue
-                total = number(g.get("总量"))
-                base = number(g.get("已完成量"))
-                if total <= 0:
-                    continue
-                done = base + done_by_goal.get(gid, 0.0)
-                if done >= total:
-                    continue          # 已经达成，不用打卡
-                result["active"] += 1
-                hit = gid in today_hit
-                # 目标明细给手机端用：上滑打卡要选目标，光知道"还有 2 个"没法选
-                row = {
-                    "id": gid,
-                    "name": name,
-                    "unit": str(scalar(g.get("单位")) or "个"),
-                    "total": round(total, 2),
-                    "done": round(done, 2),
-                    "todayHit": hit,
-                    "suggest": suggest_amount(total - done,
-                                              days_left(day_of(g.get("截止日")), today)),
-                }
-                result["goals"].append(row)
-                if not hit:
-                    pending_names.append(name)
-
         result["pending"] = len(pending_names)
         result["pendingNames"] = pending_names[:5]
         result["allDone"] = len(pending_names) == 0
     except Exception as e:  # noqa: BLE001
-        result = {"date": today, "error": str(e)[:200], "goals": [],
+        result = {"date": today, "error": str(e)[:200], "goals": [], "lastHitAt": "",
                   "checkedAt": datetime.now().strftime("%Y-%m-%d %H:%M")}
 
     try:

@@ -640,6 +640,7 @@ $handler = {
                     active    = $stS.active
                     reason    = $stS.reason
                     pending   = $pend
+                    penalty   = (Get-AfsCheckinPenaltyActive -Config $cfgS)
                     gist      = $gistS
                 }
             } catch {

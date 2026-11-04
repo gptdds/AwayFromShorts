@@ -919,6 +919,7 @@ $script:AFS_STUDY_STALE_MIN = 45
 function Get-AfsStudyFlagPath { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_STUDY_FLAG) }
 
 function Get-AfsStudyInfo {
+    param([datetime]$Now = (Get-Date))
     <# ok=$false 表示"读不到可信进度"; 其余字段来自 study.flag #>
     $p = Get-AfsStudyFlagPath
     if (-not (Test-Path $p)) { return @{ ok = $false; reason = 'flag-missing' } }
@@ -929,10 +930,10 @@ function Get-AfsStudyInfo {
     if (($j.PSObject.Properties.Name -contains 'error') -and $j.error) {
         return @{ ok = $false; reason = 'flag-error' }
     }
-    if ([string]$j.date -ne (Get-Date).ToString('yyyy-MM-dd')) {
+    if ([string]$j.date -ne $Now.ToString('yyyy-MM-dd')) {
         return @{ ok = $false; reason = 'flag-outdated' }
     }
-    if (((Get-Date) - (Get-Item $p).LastWriteTime).TotalMinutes -gt $script:AFS_STUDY_STALE_MIN) {
+    if (($Now - (Get-Item $p).LastWriteTime).TotalMinutes -gt $script:AFS_STUDY_STALE_MIN) {
         return @{ ok = $false; reason = 'flag-stale' }
     }
     @{
@@ -943,6 +944,7 @@ function Get-AfsStudyInfo {
         activeCount  = [int]$j.active
         date         = [string]$j.date
         checkedAt    = [string]$j.checkedAt
+        lastHitAt    = [string]$j.lastHitAt
     }
 }
 
@@ -951,6 +953,114 @@ function Test-AfsStudyDone {
     $s = Get-AfsStudyInfo
     if (-not $s.ok) { return $true }
     [bool]$s.allDone
+}
+
+# ---------- 学习联动: 20:00 打卡罚时 (对齐手机端 CheckinPenalty) ----------
+# 每天 20:00 判断: 今天的目标还没按时打完卡 -> 在当天屏蔽结束点之后再接续 30 分钟。
+# 例: 00:00-21:00 + 23:00-00:00 的排法, 放行点是 21:00 -> 延到 21:30 才放行。
+# 两条刻意的取舍(和手机端一致):
+#   · 一天只入账一次(按日期幂等), 否则每次轮询都加一笔, 一天能叠成十几个小时。
+#   · 入账后不撤销: 20:00 之后才把卡补上, 这 30 分钟照样要等 —— 否则"先看会儿手机再打卡"
+#     永远没有代价, 规则等于没有。
+# 读不到可信进度(flag 缺失/损坏/不是今天/超过 45 分钟没更新) 一律不入账, 绝不锁死。
+$script:AFS_CHECKIN_DUE_HOUR   = 20
+$script:AFS_CHECKIN_EXTEND_MIN = 30
+$script:AFS_CHECKIN_PENALTY    = 'checkin-penalty.json'
+
+function Get-AfsCheckinPenaltyPath { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_CHECKIN_PENALTY) }
+
+function Read-AfsCheckinPenalty {
+    $p = Get-AfsCheckinPenaltyPath
+    if (-not (Test-Path $p)) { return $null }
+    try {
+        $j = ConvertFrom-Json ([System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8))
+        if (-not $j) { return $null }
+        @{
+            date    = [string]$j.date
+            armedAt = [string]$j.armedAt
+            release = [string]$j.release
+            until   = [string]$j.until
+            pending = [int]$j.pending
+        }
+    } catch { $null }
+}
+
+function Write-AfsCheckinPenalty {
+    param($Data)
+    try { Write-AfsTextAtomic -Path (Get-AfsCheckinPenaltyPath) -Text (ConvertTo-Json $Data -Compress) } catch { }
+}
+
+# 今天的放行点: schedule.windows 里"结束时刻落在今天"的最晚一个。
+# 跨午夜窗口(23:00->00:00)结束点在次日, 不算今天; 00:00-21:00 的 21:00 照算(今天这一段)。
+function Get-AfsTodayReleasePoint {
+    param($Config, [datetime]$Now = (Get-Date))
+    $best = $null
+    foreach ($w in @($Config.schedule.windows)) {
+        $s = ConvertTo-AfsMinutes ([string]$w.start)
+        $e = ConvertTo-AfsMinutes ([string]$w.end)
+        if ($e -le $s -or $e -ge 1440) { continue }   # 跨午夜 / 起止相同 / 结束于零点: 放行点在次日
+        $cand = Get-Date -Year $Now.Year -Month $Now.Month -Day $Now.Day -Hour ([int][math]::Floor($e / 60)) -Minute ($e % 60) -Second 0 -Millisecond 0
+        if ($null -eq $best -or $cand -gt $best) { $best = $cand }
+    }
+    $best
+}
+
+# 今天算不算"没按时打完卡": 还有 pending, 或最后一笔打卡发生在今天 20:00 之后。
+function Test-AfsCheckinMissed {
+    param($StudyInfo, [datetime]$Now = (Get-Date))
+    if (-not $StudyInfo -or -not $StudyInfo.ok) { return $false }
+    if ([int]$StudyInfo.pending -gt 0) { return $true }
+    $last = [datetime]::MinValue
+    if ([string]$StudyInfo.lastHitAt -and [datetime]::TryParse([string]$StudyInfo.lastHitAt, [ref]$last)) {
+        $due = Get-Date -Year $Now.Year -Month $Now.Month -Day $Now.Day -Hour $script:AFS_CHECKIN_DUE_HOUR -Minute 0 -Second 0 -Millisecond 0
+        if ($last -gt $due) { return $true }
+    }
+    $false
+}
+
+# 每个节拍问一次: 今天这笔 30 分钟该入账了吗。幂等, 同一天重复调用不会再叠第二笔。
+# 返回 $true = 这一次刚刚入账(调用方据此打日志 / 重算冻结)。
+function Invoke-AfsCheckinPenaltyTick {
+    param($Config, [datetime]$Now = (Get-Date))
+    if (-not $Config.studyHold -or -not [bool]$Config.studyHold.enabled) { return $false }
+    if ($Now.Hour -lt $script:AFS_CHECKIN_DUE_HOUR) { return $false }
+    $today = $Now.ToString('yyyy-MM-dd')
+    $old = Read-AfsCheckinPenalty
+    if ($old -and $old.date -eq $today) { return $false }        # 一天只入账一次
+    $info = Get-AfsStudyInfo -Now $Now
+    if (-not $info.ok) { return $false }                          # fail-open
+    if (-not (Test-AfsCheckinMissed -StudyInfo $info -Now $Now)) { return $false }
+    $release = Get-AfsTodayReleasePoint -Config $Config -Now $Now
+    if ($null -eq $release) { return $false }                     # 今天没有可延长的放行点
+    $until = $release.AddMinutes($script:AFS_CHECKIN_EXTEND_MIN)
+    Write-AfsCheckinPenalty -Data @{
+        date    = $today
+        armedAt = $Now.ToString('yyyy-MM-dd HH:mm:ss')
+        release = $release.ToString('yyyy-MM-dd HH:mm')
+        until   = $until.ToString('yyyy-MM-dd HH:mm')
+        pending = [int]$info.pending
+    }
+    $true
+}
+
+# 当前是否处于"20:00 打卡罚时"这一段(只读, 供判定/面板展示)。
+function Get-AfsCheckinPenaltyActive {
+    param($Config, [datetime]$Now = (Get-Date))
+    $off = @{ active = $false; armed = $false; release = ''; until = ''; pending = 0 }
+    if (-not $Config.studyHold -or -not [bool]$Config.studyHold.enabled) { return $off }
+    $p = Read-AfsCheckinPenalty
+    if (-not $p -or $p.date -ne $Now.ToString('yyyy-MM-dd')) { return $off }
+    $rel = [datetime]::MinValue
+    $unt = [datetime]::MinValue
+    if (-not [datetime]::TryParse($p.release, [ref]$rel)) { return $off }
+    if (-not [datetime]::TryParse($p.until, [ref]$unt)) { return $off }
+    @{
+        active  = ($Now -ge $rel -and $Now -lt $unt)
+        armed   = $true
+        release = $p.release
+        until   = $p.until
+        pending = $p.pending
+    }
 }
 
 # 找 Python: 优先 WorkBuddy 内置解释器, 再退回系统安装
@@ -1046,6 +1156,10 @@ function Get-AfsActiveState {
             return @{ active = $true; reason = 'schedule' }
         }
     }
+    # 20:00 打卡罚时: 当天放行点之后再接续 30 分钟(与手机端 CheckinPenalty 同口径)。
+    # 判定只读已入账的状态(入账由引擎每分钟的 tick 负责), 避免推演时刻污染状态文件。
+    $pen = Get-AfsCheckinPenaltyActive -Config $Config -Now $Now
+    if ($pen.active) { return @{ active = $true; reason = 'study-penalty' } }
     # 已到解锁时段。学习联动: 今天目标还没全部打卡 -> 继续屏蔽, 不再挑时间段。
     # 以前这里还要求"当前时刻落在 studyHold.start-end 之内", 结果是区间之外照样放行,
     # 闸门等于漏的(放行时段没和那个区间重合的应用根本拦不住)。现在只看打完没有。
@@ -1660,6 +1774,11 @@ function Invoke-AfsEnforce {
         [switch]$Simulate,
         [string]$LogPath
     )
+    # 20:00 打卡罚时: 每分钟问一次(幂等, 一天只入账一次)。必须放在取状态之前,
+    # 否则 20:00 这一拍拿到的还是入账前的状态。干跑(Simulate)不写状态文件。
+    if (-not $Simulate) {
+        try { Invoke-AfsCheckinPenaltyTick -Config $Config | Out-Null } catch { }
+    }
     $state  = Get-AfsActiveState -Config $Config
     $active = $state.active
     # ---- 强制模式: 开启后当天内不可关闭, 到期自动解除 (不自动续期到下一天) ----

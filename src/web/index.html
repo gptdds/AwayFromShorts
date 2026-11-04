@@ -1033,6 +1033,8 @@
         </div>
         <div class="hint">
           过了今天的屏蔽时段，如果学习台里今天的目标还有没打卡的，就一直屏蔽，直到打完为止（没有结束时间）。
+          另外每天 20:00 判断一次：这时还没打卡完成（或 20:00 之后才补上最后一笔），当天屏蔽结束点就再延 30 分钟
+          （例如 21:00 放行 → 21:30 才放行），一天只记一次，补打卡也不撤销。
           读不到学习进度（WorkBuddy 没开 / 数据超过 45 分钟没更新）时会正常解锁，不会把你锁死。
         </div>
         <div class="add-row">
@@ -1041,6 +1043,7 @@
           <button class="btn" id="studyOpenBtn" type="button" title="切到学习台页签">打开学习台</button>
         </div>
         <div class="note" id="studyState">-</div>
+        <div class="hint" id="studyPenalty" style="display:none"></div>
         <div class="hint" id="studyPending" style="display:none"></div>
         <div class="hint" id="studyPrec" style="display:none"></div>
       </div>
@@ -1895,6 +1898,7 @@ const REASON_TEXT = {
   "override-block": "临时屏蔽中",
   "override-off": "临时解除中",
   "study-hold": "学习目标没打完,继续屏蔽",
+  "study-penalty": "20:00 打卡罚时,屏蔽延长 30 分钟",
   force: "强制模式生效中(屏蔽时段内)",
   disabled: "总开关已关闭",
   day: "今天不在计划日期",
@@ -2953,6 +2957,22 @@ function renderStudy() {
   }
   if (blockedNow) line += " · 屏蔽进行中，此开关暂时不可关闭";
   $("#studyState").textContent = line;
+
+  // 20:00 打卡罚时: 入账后无论补不补打卡都照延 30 分钟, 面板要说清楚今天这笔在不在
+  const pen = study.penalty || {};
+  const penEl = $("#studyPenalty");
+  if (penEl) {
+    if (pen.armed) {
+      const relHM = String(pen.release || "").slice(11);
+      const untilHM = String(pen.until || "").slice(11);
+      penEl.style.display = "";
+      penEl.textContent = pen.active
+        ? "⏱ 20:00 打卡没按时完成，屏蔽已延长到 " + untilHM + "（补打卡也不撤销）"
+        : "⏱ 今天已记一笔 30 分钟打卡罚时：放行点 " + relHM + " 延到 " + untilHM + "（补打卡也不撤销）";
+    } else {
+      penEl.style.display = "none"; penEl.textContent = "";
+    }
+  }
 
   const names = Array.isArray(study.pending) ? study.pending : [];
   const pe = $("#studyPending");
