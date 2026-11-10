@@ -1,0 +1,2180 @@
+﻿# ============================================================
+#  AwayFromShorts - core.ps1 (共享核心函数)
+#  https://github.com/sdgfdii/AwayFromShorts
+#  兼容 Windows PowerShell 5.1 (无需任何第三方依赖)
+# ============================================================
+
+$script:AFS_NAME        = 'AwayFromShorts'
+$script:AFS_VERSION     = '2.0.0'
+$script:AFS_MARK_START  = "# >>> $($script:AFS_NAME) >>> (managed by AwayFromShorts - do not edit)"
+$script:AFS_MARK_END    = "# <<< $($script:AFS_NAME) <<<"
+# 这些进程永远不杀,防止把系统/本工具自己弄死
+$script:AFS_PROTECTED   = @('powershell','pwsh','conhost','wininit','winlogon','csrss','services','lsass','smss','system','svchost','explorer')
+# 额度日从几点开始（2026-11-02 用户要求：统一早上 8 点）。
+# 手机端 DayBoundary.DEFAULT_HOUR 必须与它一致 —— 两边不一致时，跨设备共享的
+# 「今天」会在凌晨 0:00–8:00 错开，池子就会一边已清零、另一边还在算昨天。
+$script:AFS_QUOTA_RESET_HOUR = 8
+$script:AFS_LOCK_PATH   = Join-Path $env:TEMP "$($script:AFS_NAME).lock"
+$script:AfsConfigPath   = $null   # 由 enforcer / webui 覆盖
+
+function Set-AfsConfigPath { param([string]$Path) $script:AfsConfigPath = $Path }
+
+# ---------------- 额度日（统一早上 8 点） ----------------
+# 额度账本的「今天」不是墙上时间的今天：早上 8 点之前仍然算前一天，
+# 这样熬夜到凌晨不会因为过了 0 点就白拿一份新额度。
+function Get-AfsQuotaDayStart {
+    param([datetime]$Now = (Get-Date))
+    $start = $Now.Date.AddHours([int]$script:AFS_QUOTA_RESET_HOUR)
+    if ($Now -lt $start) { $start = $start.AddDays(-1) }
+    $start
+}
+
+function Get-AfsQuotaDayKey {
+    param([datetime]$Now = (Get-Date))
+    (Get-AfsQuotaDayStart $Now).ToString('yyyy-MM-dd')
+}
+
+# 自额度日起点过了多少秒。跨日那一 tick 的 elapsed 必须用它截断，
+# 否则会把 8 点之前的那段时间算进新的一天。
+function Get-AfsQuotaDaySeconds {
+    param([datetime]$Now = (Get-Date))
+    [Math]::Max(0.0, ($Now - (Get-AfsQuotaDayStart $Now)).TotalSeconds)
+}
+
+function Get-AfsConfigPath {
+    if ($script:AfsConfigPath) { return $script:AfsConfigPath }
+    (Join-Path $PSScriptRoot 'config.json')
+}
+
+function Get-AfsDefaultHostsPath {
+    if ($env:WINDIR) { Join-Path $env:WINDIR 'System32\drivers\etc\hosts' }
+    else { 'C:\Windows\System32\drivers\etc\hosts' }
+}
+
+function Get-AfsIsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p  = New-Object Security.Principal.WindowsPrincipal($id)
+    $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# ---------- 配置读写 ----------
+
+function Get-AfsDefaultConfig {
+    @{
+        version = 1
+        enabled = $true
+        schedule = @{
+            days    = @(1,2,3,4,5)   # 1=周一 ... 7=周日
+            windows = @(
+                @{ start = '19:00'; end = '22:00' }
+            )
+        }
+        blockWebsites  = $true
+        blockedSites   = @('youtube.com','www.youtube.com','m.youtube.com','youtu.be','youtube-nocookie.com','tiktok.com','www.tiktok.com','vm.tiktok.com','douyin.com','www.douyin.com','v.douyin.com')
+        blockedProcesses = @('chrome','msedge')
+        whitelist = @{ sites = @(); processes = @() }
+        override = @{ mode = 'none'; until = $null }
+        force = @{ enabled = $false; until = $null; weekdays = @() }   # 强制模式: 所选星期内强制, 强制中不可关闭(防破戒)
+        web = @{ port = 8737 }
+
+        # 学习联动: 过了今天的屏蔽时段, 若学习台里今天的目标还没全部打卡, 就一直屏蔽到打完。
+        # 只有开关、没有时间窗 —— 和手机端同口径(目标没打完 = 直接延长冻结, 打完立即放行)。
+        # study.flag 由学习台侧脚本(check_study.py)写入; 读不到/过期一律放行, 不会锁死。
+        studyHold = @{
+            enabled = $false
+        }
+
+        browser = @{
+            enabled  = $true    # 屏蔽时优雅关闭标题匹配的浏览器窗口(工作区), 其他窗口不受影响
+            windows  = @()      # 窗口标题列表(支持 * 通配符), 例如 '娱乐'
+            urlBlock = $false   # 附加: 浏览器 URLBlocklist 策略拦截 blockedSites 域名(导航层无法绕过, 需重启浏览器生效)
+            targets  = @('edge','chrome')   # 生效浏览器
+        }
+    }
+}
+
+# 递归把 ConvertFrom-Json 的 PSCustomObject 转成纯 hashtable / 数组
+function ConvertTo-AfsHashtable {
+    param($InputObject)
+    if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
+        $h = @{}
+        foreach ($p in $InputObject.PSObject.Properties) { $h[$p.Name] = ConvertTo-AfsHashtable $p.Value }
+        return $h
+    }
+    if ($InputObject -is [System.Collections.IList]) {
+        $arr = @()
+        foreach ($item in $InputObject) { $arr += ConvertTo-AfsHashtable $item }
+        return ,$arr   # 一元逗号: 防止单元素数组被 PS 自动展开成标量
+    }
+    return $InputObject
+}
+
+# 运行时文件(stats/activity)由主引擎每分钟写入, 面板可能刚好读到写了一半的内容。
+# 读不到完整文本时做几次短重试, 避免"读到空文件 -> 统计凭空清零"。
+function Read-AfsTextRetry {
+    param([string]$Path, [int]$Attempts = 4, [int]$DelayMs = 60)
+    $lastErr = '未知'
+    for ($i = 0; $i -lt $Attempts; $i++) {
+        try {
+            $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+            if ($text -and $text.Trim().Length -gt 1) { return $text }
+            $lastErr = '文件为空(可能正在写入)'
+        } catch { $lastErr = $_.Exception.Message }
+        Start-Sleep -Milliseconds $DelayMs
+    }
+    throw "读取失败: $Path ($lastErr)"
+}
+
+# 原子写: 先落临时文件再替换, 任何时刻磁盘上都有一份完整内容
+function Write-AfsTextAtomic {
+    param([string]$Path, [string]$Text)
+    $utf8 = New-Object System.Text.UTF8Encoding($false)   # 无 BOM, 兼容 web
+    $tmp = "$Path.tmp"
+    [System.IO.File]::WriteAllText($tmp, $Text, $utf8)
+    if ([System.IO.File]::Exists($Path)) {
+        try { [System.IO.File]::Replace($tmp, $Path, $null) }
+        catch { Move-Item -LiteralPath $tmp -Destination $Path -Force }
+    } else {
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+    }
+}
+
+function Read-AfsJson {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { throw "配置文件不存在: $Path" }
+    $text = Read-AfsTextRetry -Path $Path
+    $obj  = ConvertFrom-Json $text -ErrorAction Stop
+    ConvertTo-AfsHashtable $obj
+}
+
+function Write-AfsJson {
+    param([string]$Path, $Object)
+    $json = ConvertTo-Json $Object -Depth 12
+    Write-AfsTextAtomic -Path $Path -Text $json
+}
+
+function Get-AfsConfig {
+    $path = Get-AfsConfigPath
+    if (Test-Path $path) {
+        $raw  = Read-AfsJson -Path $path
+        return Merge-AfsDeep -Base (Get-AfsDefaultConfig) -Overlay $raw
+    }
+    Get-AfsDefaultConfig
+}
+
+function Merge-AfsDeep {
+    param($Base, $Overlay)
+    if ($Base -is [hashtable] -and $Overlay -is [hashtable]) {
+        $out = @{}
+        foreach ($k in $Base.Keys) {
+            $out[$k] = if ($Overlay.ContainsKey($k)) { Merge-AfsDeep -Base $Base[$k] -Overlay $Overlay[$k] } else { $Base[$k] }
+        }
+        foreach ($k in $Overlay.Keys) {
+            if (-not $out.ContainsKey($k)) { $out[$k] = $Overlay[$k] }
+        }
+        return $out
+    }
+    if ($null -ne $Overlay) { return ,$Overlay }   # 一元逗号: 数组(尤其单元素)原样返回, 不被展开成标量
+    $Base
+}
+
+# 列表规范化: 数组原样, 哈希表取 Keys, 标量包成数组 (防止对象被 ToString 成 "System.Collections.Hashtable")
+function Normalize-AfsList {
+    param($Value)
+    if ($null -eq $Value) { return @() }
+    if ($Value -is [System.Collections.IDictionary]) { return @($Value.Keys) }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) { return @($Value) }
+    return @($Value)
+}
+
+# ---------- 站点项解析 (支持"域名"与"域名/路径"两种写法) ----------
+# 站点项允许两种形态:
+#   www.bilibili.com            -> 纯域名, 走 hosts + URLBlocklist 全站拦截
+#   www.bilibili.com/video/*    -> 带路径, 只能走 URLBlocklist (hosts 无法表达路径), 用于"整站屏蔽但放行某类页面"
+# 解析结果: @{ host; path; isPath; valid }  —— path 为空串表示纯域名
+function Parse-AfsSiteEntry {
+    param([string]$Entry)
+    $res = @{ host = ''; path = ''; isPath = $false; valid = $false }
+    if ($null -eq $Entry) { return $res }
+    $s = ([string]$Entry).Trim().ToLower()
+    if (-not $s) { return $res }
+    # 去掉误粘进来的协议头
+    $s = $s -replace '^[a-z]+://', ''
+    # 去掉 fragment 与其后内容, 去掉 query string
+    #   用户常直接复制浏览器地址栏整条 URL(如 .../video/BV1xx/?vd_source=xxx),
+    #   query 对路径匹配无意义且长度不定, 一律剥离。
+    $s = $s -replace '#.*$', ''
+    $s = $s -replace '\?.*$', ''
+    if (-not $s) { return $res }
+
+    # 拆 host / path —— 注意: 保留 path 尾部的 '*'(通配符是有效的模式语法, 不能砍)
+    $slash = $s.IndexOf('/')
+    if ($slash -lt 0) {
+        $hostPart = $s; $pathPart = ''
+    } else {
+        $hostPart = $s.Substring(0, $slash); $pathPart = $s.Substring($slash)
+    }
+
+    # 主机名: 允许 * 通配符(仅用于 . 分隔的子域段), 允许字母数字点横线
+    if (-not $hostPart) { return $res }
+    if ($hostPart -notmatch '^(\*\.)?[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)*$') { return $res }
+    if ($hostPart -notmatch '\.') { return $res }   # 必须有至少一个点(排除单段词)
+
+    # 路径: 允许字母数字和常见 URL 字符, 允许 * 通配
+    if ($pathPart) {
+        if ($pathPart -notmatch '^/[a-z0-9\-_./~%*+]*$') { return $res }
+        # 只保留结尾的 '*' 通配; 连续斜杠归一
+        $pathPart = $pathPart -replace '/+$', '/'
+        # "/" 或 "/*" 等价于"任意路径", 视作纯域名(整站)处理更符合直觉
+        if ($pathPart -eq '/' -or $pathPart -eq '/*') { $pathPart = '' }
+        if ($pathPart) {
+            # 结尾裸露的 '/' 表示前缀匹配, 补一个 '*' 让意图显式
+            if ($pathPart.EndsWith('/')) { $pathPart += '*' }
+            $res.path = $pathPart
+            $res.isPath = $true
+        }
+    }
+    $res.host = $hostPart
+    $res.valid = $true
+    $res
+}
+
+# 站点项 -> 纯域名 (路径模式取其主机部分), 供 hosts 使用
+function Get-AfsSiteHost {
+    param([string]$Entry)
+    $p = Parse-AfsSiteEntry -Entry $Entry
+    if ($p.valid) { return $p.host }
+    ''
+}
+
+# 列表签名: 小写 / 去首尾空白 / 去重 / 排序后拼接, 用于判断"名单内容是否被改动"
+# (域名与进程名都大小写不敏感; 只改大小写、重复填写或调换填写顺序不算改动)
+function Get-AfsListSignature {
+    param($List)
+    $arr = New-Object System.Collections.ArrayList
+    foreach ($x in @($List)) {
+        if ($null -eq $x) { continue }
+        $s = ([string]$x).Trim().ToLowerInvariant()
+        if ($s) { [void]$arr.Add($s) }
+    }
+    if ($arr.Count -eq 0) { return '' }
+    return (@($arr | Sort-Object -Unique) -join '|')
+}
+
+# 名单差异摘要: 返回 '+ 新增项' / '- 删除项' (大小写不敏感), 用于给用户看"排队了什么"
+function Get-AfsListDelta {
+    param($Old, $New)
+    $oldArr = @(Normalize-AfsList $Old | ForEach-Object { if ($null -ne $_) { ([string]$_).Trim() } } | Where-Object { $_ })
+    $newArr = @(Normalize-AfsList $New | ForEach-Object { if ($null -ne $_) { ([string]$_).Trim() } } | Where-Object { $_ })
+    $oldSet = @{}
+    foreach ($x in $oldArr) { $oldSet[$x.ToLowerInvariant()] = $true }
+    $newSet = @{}
+    foreach ($x in $newArr) { $newSet[$x.ToLowerInvariant()] = $true }
+    $out = New-Object System.Collections.ArrayList
+    foreach ($x in $newArr) { if (-not $oldSet.ContainsKey($x.ToLowerInvariant())) { [void]$out.Add("+ $x") } }
+    foreach ($x in $oldArr) { if (-not $newSet.ContainsKey($x.ToLowerInvariant())) { [void]$out.Add("- $x") } }
+    @($out)
+}
+
+# 名单新增项 / 删除项 (大小写不敏感, 去首尾空白), 用于判断改动方向是"收紧"还是"放宽"
+#   收紧 tighten = 屏蔽名单加项 / 白名单删项  -> 屏蔽更严, 可以排队
+#   放宽 widen   = 屏蔽名单删项 / 白名单加项  -> 直接放行, 必须拒绝
+function Get-AfsListAdded {
+    param($Old, $New)
+    $oldSet = @{}
+    foreach ($x in @(Normalize-AfsList $Old)) {
+        if ($null -eq $x) { continue }
+        $s = ([string]$x).Trim().ToLowerInvariant()
+        if ($s) { $oldSet[$s] = $true }
+    }
+    $out = New-Object System.Collections.ArrayList
+    foreach ($x in @(Normalize-AfsList $New)) {
+        if ($null -eq $x) { continue }
+        $s = ([string]$x).Trim()
+        if ($s -and -not $oldSet.ContainsKey($s.ToLowerInvariant())) { [void]$out.Add($s) }
+    }
+    @($out)
+}
+
+function Get-AfsListRemoved {
+    param($Old, $New)
+    $newSet = @{}
+    foreach ($x in @(Normalize-AfsList $New)) {
+        if ($null -eq $x) { continue }
+        $s = ([string]$x).Trim().ToLowerInvariant()
+        if ($s) { $newSet[$s] = $true }
+    }
+    $out = New-Object System.Collections.ArrayList
+    foreach ($x in @(Normalize-AfsList $Old)) {
+        if ($null -eq $x) { continue }
+        $s = ([string]$x).Trim()
+        if ($s -and -not $newSet.ContainsKey($s.ToLowerInvariant())) { [void]$out.Add($s) }
+    }
+    @($out)
+}
+
+# 强制模式开启期间, 把配置改动分成三类 (防破戒):
+#   硬拒 hard  : 屏蔽星期 / 屏蔽时段 / 强制模式本体 —— 它们定义"何时算屏蔽时段", 改了就等于绕开强制
+#   放宽 widen : 屏蔽时段内删黑名单 / 加白名单 / 删白名单 / 关掉屏蔽开关 —— 都是"直接放行", 一律拒绝
+#                (名单在屏蔽时段内「只进不出」: 只能加, 不能删; 非屏蔽时段可自由增删)
+#   可排队 queue: 新增屏蔽项 / 打开屏蔽开关 —— 方向是"更严", 保存时立即写入 config
+#                (只收紧无放行风险, 引擎常规 tick 自动应用; 急用走面板「立即应用」人工触发)
+# 返回 @{ any; hardKeys; hardMsg; widenKeys; widenLabels; widenMsg; queueKeys; queueLabels; queueMsg }
+# 抽成独立函数是为了能脱离 HTTP 服务做离线回归测试。
+function Get-AfsConfigLockDiff {
+    param($Current, $Incoming)
+    $res = @{
+        any = $false
+        hardKeys = @(); hardMsg = $null
+        widenKeys = @(); widenLabels = @(); widenMsg = $null
+        queueKeys = @(); queueLabels = @(); queueMsg = $null
+    }
+    if ($null -eq $Current -or $null -eq $Incoming) { return $res }
+
+    $hardKeys    = New-Object System.Collections.ArrayList
+    $widenKeys   = New-Object System.Collections.ArrayList
+    $widenLabels = New-Object System.Collections.ArrayList
+    $queueKeys   = New-Object System.Collections.ArrayList
+    $queueLabels = New-Object System.Collections.ArrayList
+    $widenMsg    = $null    # 多条放宽项时只展示第一条原因
+    $queueMsg    = $null
+
+    # 1) 屏蔽计划: 硬拒
+    if ((Get-AfsListSignature $Current.schedule.days) -ne (Get-AfsListSignature $Incoming.schedule.days)) {
+        [void]$hardKeys.Add('schedule.days')
+        if (-not $res.hardMsg) {
+            $res.hardMsg = '强制模式开启中, 无法更改「屏蔽星期」(防破戒)。屏蔽星期 / 屏蔽时段不参与排队 —— 它们定义了"何时算非屏蔽时段", 改了排队规则本身就会失效。请先在「强制模式」卡片关闭强制模式, 再修改屏蔽日期。'
+        }
+    }
+    $curWin = @(Normalize-AfsList $Current.schedule.windows | Where-Object { $_ } | ForEach-Object { "$($_.start)-$($_.end)" })
+    $newWin = @(Normalize-AfsList $Incoming.schedule.windows | Where-Object { $_ } | ForEach-Object { "$($_.start)-$($_.end)" })
+    if ((Get-AfsListSignature $curWin) -ne (Get-AfsListSignature $newWin)) {
+        [void]$hardKeys.Add('schedule.windows')
+        if (-not $res.hardMsg) {
+            $res.hardMsg = '强制模式开启中, 无法更改「屏蔽时段」(防破戒)。屏蔽星期 / 屏蔽时段不参与排队, 请先在「强制模式」卡片关闭强制模式, 再修改屏蔽时间段。'
+        }
+    }
+
+    # 1b) 强制模式本体(开关 / 强制星期): 同属"何时算强制时段"的定义 -> 硬拒
+    #     走 /api/config 把 force.enabled 改掉, 或把今天从 force.weekdays 里去掉, 强制模式会立刻
+    #     变成"未生效" —— 既绕开强制, 也顺带绕开基于"此刻是否生效"判定的卸载守卫。
+    #     强制模式的任何字段一律只走「强制模式」卡片(/api/force), 那里的关闭动作会同步清理状态文件。
+    #     注意: 传入配置缺少 force 块 = 会被 Set-AfsConfigSafe 合并回默认值(enabled=false),
+    #          所以"字段缺失"必须按"改成了关闭"处理, 不能当成"没动"。
+    $curOn  = [bool]$Current.force.enabled
+    $newOn  = [bool]$Incoming.force.enabled
+    $curFwd = @($Current.force.weekdays)
+    $newFwd = @($Incoming.force.weekdays)
+    if ($curOn -ne $newOn -or (Get-AfsListSignature $curFwd) -ne (Get-AfsListSignature $newFwd)) {
+        [void]$hardKeys.Add('force')
+        if (-not $res.hardMsg) {
+            $res.hardMsg = '强制模式的「开关 / 强制星期」不能通过「保存更改」修改(防破戒: 它们定义了何时算强制时段, 改掉就等于绕开强制)。请用「强制模式」卡片上的开启 / 关闭按钮操作 —— 关闭时会同时清理独立状态文件。'
+        }
+    }
+
+    # 2) 屏蔽网页
+    #    加域名 = 收紧 -> 可排队;  删域名 = 放宽 -> 拒 (删掉就等于放行)
+    $rmSites = @(Get-AfsListRemoved -Old $Current.blockedSites -New $Incoming.blockedSites)
+    $adSites = @(Get-AfsListAdded   -Old $Current.blockedSites -New $Incoming.blockedSites)
+    if ($rmSites.Count -gt 0) {
+        [void]$widenKeys.Add('sites'); [void]$widenLabels.Add('「屏蔽网页」域名')
+        if (-not $widenMsg) {
+            $widenMsg = '屏蔽时段内, 屏蔽网页名单「只能新增, 不能删减」—— 无法删除域名: ' + ($rmSites -join '、') + ' (删掉就等于放行)。本次改动已整体拒绝, 想删请等当前屏蔽时段结束后再操作。'
+        }
+    }
+    if ($adSites.Count -gt 0) {
+        [void]$queueKeys.Add('sites'); [void]$queueLabels.Add('「屏蔽网页」域名名单')
+    }
+
+    #    「屏蔽网站」总开关: 只能开, 不能关
+    $curWeb = [bool]$Current.blockWebsites
+    $newWeb = [bool]$Incoming.blockWebsites
+    if ($curWeb -ne $newWeb) {
+        if ($curWeb) {
+            [void]$widenKeys.Add('webSwitch'); [void]$widenLabels.Add('「屏蔽网站」总开关')
+            if (-not $widenMsg) {
+                $widenMsg = '强制模式生效中, 只能收紧不能放宽 —— 无法关闭「屏蔽网站」总开关 (关掉就等于放行)。想关请等当前屏蔽时段结束后再操作。'
+            }
+        } else {
+            [void]$queueKeys.Add('webSwitch'); [void]$queueLabels.Add('「屏蔽网站」总开关')
+        }
+    }
+
+    #    Edge 工作区名单: 加工作区 = 收紧, 删工作区 = 放宽
+    $rmWin = @(Get-AfsListRemoved -Old ($Current.browser).windows -New ($Incoming.browser).windows)
+    $adWin = @(Get-AfsListAdded   -Old ($Current.browser).windows -New ($Incoming.browser).windows)
+    if ($rmWin.Count -gt 0) {
+        [void]$widenKeys.Add('browserWindows'); [void]$widenLabels.Add('「屏蔽 Edge 工作区」名单')
+        if (-not $widenMsg) {
+            $widenMsg = '屏蔽时段内, Edge 工作区名单「只能新增, 不能删减」—— 无法删除工作区: ' + ($rmWin -join '、') + ' (删掉就等于放行)。想删请等当前屏蔽时段结束后再操作。'
+        }
+    }
+    if ($adWin.Count -gt 0) {
+        [void]$queueKeys.Add('browserWindows'); [void]$queueLabels.Add('「屏蔽 Edge 工作区」名单')
+    }
+
+    #    工作区屏蔽开关 / 网址拦截开关: 都只能开, 不能关
+    $curBEn = [bool]($Current.browser).enabled
+    $newBEn = [bool]($Incoming.browser).enabled
+    if ($curBEn -ne $newBEn) {
+        if ($curBEn) {
+            [void]$widenKeys.Add('browserSwitch'); [void]$widenLabels.Add('浏览器屏蔽开关')
+            if (-not $widenMsg) { $widenMsg = '强制模式生效中, 只能收紧不能放宽 —— 无法关闭「工作区屏蔽」开关 (关掉就等于放行)。' }
+        } else {
+            [void]$queueKeys.Add('browserSwitch'); [void]$queueLabels.Add('浏览器屏蔽开关')
+        }
+    }
+    $curBUrl = [bool]($Current.browser).urlBlock
+    $newBUrl = [bool]($Incoming.browser).urlBlock
+    if ($curBUrl -ne $newBUrl) {
+        if ($curBUrl) {
+            [void]$widenKeys.Add('browserSwitch'); [void]$widenLabels.Add('浏览器屏蔽开关')
+            if (-not $widenMsg) { $widenMsg = '强制模式生效中, 只能收紧不能放宽 —— 无法关闭「网址拦截」开关 (关掉就等于放行)。' }
+        } else {
+            [void]$queueKeys.Add('browserSwitch'); [void]$queueLabels.Add('浏览器屏蔽开关')
+        }
+    }
+
+    # 3) 屏蔽进程: 加进程 = 收紧 -> 可排队;  删进程 = 放宽 -> 拒
+    $rmProc = @(Get-AfsListRemoved -Old $Current.blockedProcesses -New $Incoming.blockedProcesses)
+    $adProc = @(Get-AfsListAdded   -Old $Current.blockedProcesses -New $Incoming.blockedProcesses)
+    if ($rmProc.Count -gt 0) {
+        [void]$widenKeys.Add('processes'); [void]$widenLabels.Add('「屏蔽进程」名单')
+        if (-not $widenMsg) {
+            $widenMsg = '屏蔽时段内, 屏蔽进程名单「只能新增, 不能删减」—— 无法删除进程: ' + ($rmProc -join '、') + ' (删掉就等于放行)。本次改动已整体拒绝, 想删请等当前屏蔽时段结束后再操作。'
+        }
+    }
+    if ($adProc.Count -gt 0) {
+        [void]$queueKeys.Add('processes'); [void]$queueLabels.Add('「屏蔽进程」名单')
+    }
+
+    # 4) 白名单: 方向与屏蔽名单正好相反 —— 删项 = 收紧(可排队), 加项 = 放宽(拒)
+    $adWlS = @(Get-AfsListAdded   -Old ($Current.whitelist).sites -New ($Incoming.whitelist).sites)
+    $rmWlS = @(Get-AfsListRemoved -Old ($Current.whitelist).sites -New ($Incoming.whitelist).sites)
+    if ($adWlS.Count -gt 0) {
+        [void]$widenKeys.Add('wlSites'); [void]$widenLabels.Add('「白名单域名」')
+        if (-not $widenMsg) {
+            $widenMsg = '强制模式生效中, 白名单「只能删减, 不能新增」—— 无法把域名加入白名单: ' + ($adWlS -join '、') + ' (加入白名单等于变相放行)。'
+        }
+    }
+    # 白名单「只进不出」: 屏蔽时段内删白名单同样是"放宽", 一律拒绝; 非屏蔽时段可自由删。
+    if ($rmWlS.Count -gt 0) {
+        [void]$widenKeys.Add('whitelist'); [void]$widenLabels.Add('「白名单域名」')
+        if (-not $widenMsg) {
+            $widenMsg = '屏蔽时段内, 白名单「只进不出」—— 无法删除白名单域名: ' + ($rmWlS -join '、') + '。想删请等当前屏蔽时段结束后再操作。'
+        }
+    }
+    $adWlP = @(Get-AfsListAdded   -Old ($Current.whitelist).processes -New ($Incoming.whitelist).processes)
+    $rmWlP = @(Get-AfsListRemoved -Old ($Current.whitelist).processes -New ($Incoming.whitelist).processes)
+    if ($adWlP.Count -gt 0) {
+        [void]$widenKeys.Add('wlProcs'); [void]$widenLabels.Add('「白名单进程」')
+        if (-not $widenMsg) {
+            $widenMsg = '强制模式生效中, 白名单「只能删减, 不能新增」—— 无法把进程加入白名单: ' + ($adWlP -join '、') + ' (加入白名单等于变相放行)。'
+        }
+    }
+    # 白名单「只进不出」: 同上, 屏蔽时段内不能删白名单进程
+    if ($rmWlP.Count -gt 0) {
+        [void]$widenKeys.Add('whitelist'); [void]$widenLabels.Add('「白名单进程」')
+        if (-not $widenMsg) {
+            $widenMsg = '屏蔽时段内, 白名单「只进不出」—— 无法删除白名单进程: ' + ($rmWlP -join '、') + '。想删请等当前屏蔽时段结束后再操作。'
+        }
+    }
+
+    $res.hardKeys    = @($hardKeys)
+    $res.widenKeys   = @($widenKeys)
+    $res.widenLabels = @($widenLabels)
+    $res.queueKeys   = @($queueKeys)
+    $res.queueLabels = @($queueLabels)
+    $res.widenMsg    = $widenMsg
+    $res.any         = (($hardKeys.Count + $widenKeys.Count + $queueKeys.Count) -gt 0)
+    # 有放宽项时整体会被拒, 此时再说"已进入排队"是误导, 所以不生成排队文案
+    if ($queueKeys.Count -gt 0 -and -not $widenMsg) {
+        $queueMsg = '强制模式生效中, ' + (@($queueLabels) -join ' / ') + ' 的改动无法立即生效, 已进入排队。'
+    }
+    $res.queueMsg = $queueMsg
+    $res
+}
+
+# 兼容入口: 返回"必须拒绝"的原因(字符串), 无拒绝返回 $null。
+#   -ForceActive 表示当前确实处于强制生效时段: 此时"放宽"类改动也要拒绝 (只能增不能删)。
+#   不传该开关时只检查硬拒项(屏蔽星期 / 屏蔽时段), 便于离线回归单测。
+function Test-AfsConfigLockViolation {
+    param($Current, $Incoming, [switch]$ForceActive)
+    $d = Get-AfsConfigLockDiff -Current $Current -Incoming $Incoming
+    if ($d.hardMsg)  { return $d.hardMsg }
+    if ($ForceActive -and $d.widenMsg) { return $d.widenMsg }
+    $null
+}
+
+# ---------- 待生效队列 (兼容保留) ----------
+# 旧版: 强制模式生效时段内, 屏蔽名单类改动先落到 pending-config.json, 等本次屏蔽时段结束由引擎合并。
+# 现在: 收紧类改动保存时立即落地(webui.ps1 直接 Merge-AfsPendingTighten 写 config)。
+# 队列文件机制保留, 仅用于兼容清理历史遗留的 pending-config.json。
+
+function Get-AfsPendingPath {
+    (Join-Path (Split-Path (Get-AfsConfigPath)) 'pending-config.json')
+}
+
+function Read-AfsPendingQueue {
+    $p = Get-AfsPendingPath
+    if (-not (Test-Path $p)) { return $null }
+    try {
+        $q = Read-AfsJson -Path $p
+        if ($null -eq $q -or $null -eq $q.patch) { return $null }
+        $q
+    } catch { $null }
+}
+
+function Remove-AfsPendingQueue {
+    $p = Get-AfsPendingPath
+    if (Test-Path $p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+}
+
+# 由"当前生效配置"与"用户期望配置"的差异, 生成只含可排队字段的补丁
+# 返回 @{ patch; grouped; total } —— total=0 表示锁定字段无差异(此时应清空队列)
+function New-AfsPendingPatch {
+    param($Current, $Incoming)
+    $patch   = @{}
+    $grouped = @{ sites = @(); switches = @(); browser = @(); processes = @(); whitelist = @() }
+
+    # 只收"收紧"方向的改动 —— 放宽类(删屏蔽项 / 关屏蔽开关 / 往白名单加项)应当先被
+    # Get-AfsConfigLockDiff 拦下; 这里再兜一层: 即使有人绕过接口直接调用, 生成的补丁也只会让屏蔽更严。
+    $adSites = @(Get-AfsListAdded -Old $Current.blockedSites -New $Incoming.blockedSites)
+    if ($adSites.Count -gt 0) {
+        $patch.blockedSites = @(Normalize-AfsList (@($Current.blockedSites) + $adSites) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+        $grouped.sites = [string[]]@($adSites | ForEach-Object { "+ $_" })
+    }
+    # 总开关: 只有"从关到开"才进队列
+    if ((-not [bool]$Current.blockWebsites) -and [bool]$Incoming.blockWebsites) {
+        $patch.blockWebsites = $true
+        $grouped.switches = @('网站屏蔽总开关 -> 开启')
+    }
+    # Edge 工作区 / 浏览器拦截开关 (同属 browser, 合并进一个 patch 节点)
+    $bPatch = @{}
+    $bLines = New-Object System.Collections.ArrayList
+    $adWin = @(Get-AfsListAdded -Old ($Current.browser).windows -New ($Incoming.browser).windows)
+    if ($adWin.Count -gt 0) {
+        $bPatch.windows = @(Normalize-AfsList (@($Current.browser.windows) + $adWin) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+        foreach ($x in $adWin) { [void]$bLines.Add("+ $x") }
+    }
+    if ((-not [bool]($Current.browser).enabled) -and [bool]($Incoming.browser).enabled) {
+        $bPatch.enabled = $true
+        [void]$bLines.Add('工作区屏蔽开关 -> 开启')
+    }
+    if ((-not [bool]($Current.browser).urlBlock) -and [bool]($Incoming.browser).urlBlock) {
+        $bPatch.urlBlock = $true
+        [void]$bLines.Add('网址拦截开关 -> 开启')
+    }
+    if ($bPatch.Count -gt 0) { $patch.browser = $bPatch; $grouped.browser = [string[]]$bLines.ToArray() }
+
+    # 屏蔽进程
+    $adProc = @(Get-AfsListAdded -Old $Current.blockedProcesses -New $Incoming.blockedProcesses)
+    if ($adProc.Count -gt 0) {
+        $patch.blockedProcesses = @(Normalize-AfsList (@($Current.blockedProcesses) + $adProc) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+        $grouped.processes = [string[]]@($adProc | ForEach-Object { "+ $_" })
+    }
+
+    # 白名单方向相反: 只有"被删掉的项"才进队列(补丁里存删减后的名单), 新增项一律忽略
+    $wLines = New-Object System.Collections.ArrayList
+    $wPatch = @{}
+    $rmWlS = @(Get-AfsListRemoved -Old ($Current.whitelist).sites -New ($Incoming.whitelist).sites)
+    if ($rmWlS.Count -gt 0) {
+        $rmSetS = @($rmWlS | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() })
+        $wPatch.sites = @(Normalize-AfsList $Current.whitelist.sites |
+            ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -and ($_.ToLowerInvariant() -notin $rmSetS) })
+        foreach ($x in $rmWlS) { [void]$wLines.Add('域名 - ' + $x) }
+    }
+    $rmWlP = @(Get-AfsListRemoved -Old ($Current.whitelist).processes -New ($Incoming.whitelist).processes)
+    if ($rmWlP.Count -gt 0) {
+        $rmSetP = @($rmWlP | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() })
+        $wPatch.processes = @(Normalize-AfsList $Current.whitelist.processes |
+            ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -and ($_.ToLowerInvariant() -notin $rmSetP) })
+        foreach ($x in $rmWlP) { [void]$wLines.Add('进程 - ' + $x) }
+    }
+    if ($wPatch.Count -gt 0) { $patch.whitelist = $wPatch; $grouped.whitelist = [string[]]$wLines.ToArray() }
+
+    $total = 0
+    foreach ($k in @('sites','switches','browser','processes','whitelist')) { $total += @($grouped[$k]).Count }
+
+    @{ patch = $patch; grouped = $grouped; total = $total }
+}
+
+function Save-AfsPendingQueue {
+    param($Current, $Incoming, [string]$Reason = '强制模式生效中')
+    $np = New-AfsPendingPatch -Current $Current -Incoming $Incoming
+    if ([int]$np.total -le 0) { Remove-AfsPendingQueue; return $null }
+    $old = Read-AfsPendingQueue
+    $q = @{
+        version   = 1
+        createdAt = $(if ($old -and $old.createdAt) { $old.createdAt } else { (Get-Date).ToString('o') })
+        updatedAt = (Get-Date).ToString('o')
+        reason    = $Reason
+        total     = [int]$np.total
+        grouped   = $np.grouped
+        patch     = $np.patch
+    }
+    Write-AfsJson -Path (Get-AfsPendingPath) -Object $q
+    $q
+}
+
+# 把队列补丁按"只收紧"的规则合并进配置 —— 屏蔽名单取并集、白名单取交集、开关取"或"。
+# 这套运算天然幂等, 且不信任队列文件的内容: 即使 pending-config.json 被手工改成"删项"或"关开关",
+# 落地时也只会被忽略, 不可能借排队机制放宽屏蔽。
+# 只认这几个字段, 补丁里夹带的其他键(如 schedule)一律不生效。
+function Merge-AfsPendingTighten {
+    param($Base, $Patch)
+    $out = Merge-AfsDeep -Base $Base -Overlay @{}
+
+    $pSites = @(Normalize-AfsList $Patch.blockedSites | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+    $out.blockedSites = @(Normalize-AfsList (@($Base.blockedSites) + $pSites) |
+        ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+
+    $pProc = @(Normalize-AfsList $Patch.blockedProcesses | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+    $out.blockedProcesses = @(Normalize-AfsList (@($Base.blockedProcesses) + $pProc) |
+        ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+
+    $out.blockWebsites = [bool]([bool]$Base.blockWebsites -or [bool]$Patch.blockWebsites)
+
+    $pWin = @(Normalize-AfsList ($Patch.browser).windows | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+    $out.browser = @{
+        enabled  = [bool]([bool]($Base.browser).enabled  -or [bool]($Patch.browser).enabled)
+        urlBlock = [bool]([bool]($Base.browser).urlBlock -or [bool]($Patch.browser).urlBlock)
+        windows  = @(Normalize-AfsList (@(($Base.browser).windows) + $pWin) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+        targets  = @(($Base.browser).targets)
+    }
+
+    # 白名单: 交集 —— 补丁里留下的项才保留, 补丁想加的项不可能进白名单。
+    # 注意: 补丁里没有 whitelist(或只带了其中一半)时表示"这部分没动", 必须原样保留 Base;
+    #       若一律按交集处理, 会因为"补丁里没这一项"而把用户的白名单整体清空。
+    $wlSrc = $Patch.whitelist
+    $keepS = $null
+    $keepP = $null
+    if ($null -ne $wlSrc -and $null -ne $wlSrc.sites) {
+        $keepS = @{}
+        foreach ($x in @(Normalize-AfsList $wlSrc.sites)) {
+            if ($null -eq $x) { continue }
+            $s = ([string]$x).Trim().ToLowerInvariant()
+            if ($s) { $keepS[$s] = $true }
+        }
+    }
+    if ($null -ne $wlSrc -and $null -ne $wlSrc.processes) {
+        $keepP = @{}
+        foreach ($x in @(Normalize-AfsList $wlSrc.processes)) {
+            if ($null -eq $x) { continue }
+            $s = ([string]$x).Trim().ToLowerInvariant()
+            if ($s) { $keepP[$s] = $true }
+        }
+    }
+    $out.whitelist = @{
+        sites     = $(if ($null -eq $keepS) { @(($Base.whitelist).sites) } else {
+            @(Normalize-AfsList ($Base.whitelist).sites |
+                ForEach-Object { $s = ([string]$_).Trim(); if ($s -and $keepS.ContainsKey($s.ToLowerInvariant())) { $s } })
+        })
+        processes = $(if ($null -eq $keepP) { @(($Base.whitelist).processes) } else {
+            @(Normalize-AfsList ($Base.whitelist).processes |
+                ForEach-Object { $s = ([string]$_).Trim(); if ($s -and $keepP.ContainsKey($s.ToLowerInvariant())) { $s } })
+        })
+    }
+
+    $out
+}
+
+# 把排队内容合并进 config.json。
+# 只在"非强制生效时段"(= 非屏蔽时段)才落地 —— 那时加/减名单没有任何放行收益, 用户随时可改。
+# 返回 @{ applied; reason; total }
+function Invoke-AfsPendingApply {
+    param($Config = $null, [switch]$IgnoreWindow)
+    $q = Read-AfsPendingQueue
+    if (-not $q) { return @{ applied = $false; reason = 'empty'; total = 0 } }
+    if (-not $Config) { $Config = Get-AfsConfig }
+    if (-not $IgnoreWindow) {
+        $fa = Test-AfsForceActive -Config $Config
+        if ($fa.active) { return @{ applied = $false; reason = 'force-active'; total = [int]$q.total; pending = $q } }
+    }
+    $merged = Merge-AfsPendingTighten -Base $Config -Patch $q.patch
+    Set-AfsConfigSafe -InputConfig $merged | Out-Null
+    Remove-AfsPendingQueue
+    @{ applied = $true; reason = 'ok'; total = [int]$q.total; patch = $q.patch }
+}
+
+# 校验 + 规范化 + 落盘
+function Set-AfsConfigSafe {
+    param($InputConfig)
+    $cfg = Merge-AfsDeep -Base (Get-AfsDefaultConfig) -Overlay $InputConfig
+$null = $cfg.Remove('clash')   # Clash 接管功能已移除 (v1.2.7): 清理旧配置残留
+    $cfg.enabled = [bool]$cfg.enabled
+
+    $cfg.schedule.days = @(Normalize-AfsList $cfg.schedule.days | ForEach-Object { try { [int]$_ } catch { 0 } } |
+        Where-Object { $_ -ge 1 -and $_ -le 7 } | Sort-Object -Unique)
+
+    $cfg.schedule.windows = @(Normalize-AfsList $cfg.schedule.windows | ForEach-Object {
+        $s = [string]$_.start; $e = [string]$_.end
+        if ($s -match '^\d{1,2}:\d{2}$' -and $e -match '^\d{1,2}:\d{2}$') {
+            $sh = [int]($s -split ':')[0]; $sm = [int]($s -split ':')[1]
+            $eh = [int]($e -split ':')[0]; $em = [int]($e -split ':')[1]
+            if ($sh -le 23 -and $sm -le 59 -and $eh -le 23 -and $em -le 59) {
+                @{ start = $s; end = $e }
+            }
+        }
+    })
+
+    $cfg.blockWebsites = [bool]$cfg.blockWebsites
+    # 站点项支持"域名"与"域名/路径"两种写法(后者仅走 URLBlocklist, 用于整站屏蔽+路径放行)
+    $cfg.blockedSites = @(Normalize-AfsList $cfg.blockedSites |
+        ForEach-Object { ([string]$_).Trim().ToLower() } |
+        Where-Object { (Parse-AfsSiteEntry -Entry $_).valid } | Sort-Object -Unique)
+    $cfg.blockedProcesses = @(Normalize-AfsList $cfg.blockedProcesses | ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { $_ } | Sort-Object -Unique)
+
+    $cfg.whitelist.sites = @(Normalize-AfsList $cfg.whitelist.sites |
+        ForEach-Object { ([string]$_).Trim().ToLower() } |
+        Where-Object { (Parse-AfsSiteEntry -Entry $_).valid } | Sort-Object -Unique)
+    $cfg.whitelist.processes = @(Normalize-AfsList $cfg.whitelist.processes | ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { $_ } | Sort-Object -Unique)
+
+    if ($cfg.override.mode -notin @('none','block','off')) { $cfg.override.mode = 'none' }
+    if (-not $cfg.override.until) { $cfg.override.until = $null }
+
+    # 强制模式: 生效时规范化 until; 未生效时保留用户 enabled 设置 (窗口外开启的强制等下次屏蔽时段自动生效)
+    $forceNow = Test-AfsForceActive -Config $cfg
+    if ($forceNow.active) {
+        $cfg.force.enabled = $true
+        $cfg.force.until  = if ($forceNow.until) { $forceNow.until.ToString('o') } else { $null }   # 长期模式(星期循环) until 为空
+    } else {
+        $cfg.force.until = $null
+    }
+
+    try { $cfg.web.port = [int]$cfg.web.port } catch { $cfg.web.port = 8737 }
+    if ($cfg.web.port -lt 1 -or $cfg.web.port -gt 65535) { $cfg.web.port = 8737 }
+
+    # 学习联动: 只有开关。老 config.json 里残留的 start/end 一律忽略(不再参与判定、也不再下发)
+    if ($cfg.studyHold) {
+        $sh = $cfg.studyHold
+        $sh.enabled = [bool]$sh.enabled
+        $cfg.studyHold = $sh
+    }
+
+    $cfg.browser.enabled  = [bool]$cfg.browser.enabled
+    $cfg.browser.urlBlock = [bool]$cfg.browser.urlBlock
+    $cfg.browser.windows = @(Normalize-AfsList $cfg.browser.windows | ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { $_ } | Sort-Object -Unique)
+    $cfg.browser.targets = @(Normalize-AfsList $cfg.browser.targets | ForEach-Object { ([string]$_).Trim().ToLower() } |
+        Where-Object { $_ -in @('edge','chrome') } | Sort-Object -Unique)
+    if ($cfg.browser.targets.Count -eq 0) { $cfg.browser.targets = @('edge','chrome') }
+
+    Write-AfsJson -Path (Get-AfsConfigPath) -Object $cfg
+
+    # ★ hub 配置推送钩子（Gist 中心仓库）：配置一落盘就把 PC 分节推上去。
+    #   fire-and-forget：隐藏进程跑 hub_config.ps1 -PushOnly，内部有 120 秒节流，
+    #   引擎每分钟的自动写盘（宽限结束、force 修复等）不会真的每分钟都推。
+    #   推送失败只留日志，绝不影响屏蔽主流程。
+    try {
+        $hubState = Join-Path (Split-Path (Get-AfsConfigPath)) 'hub-state.json'
+        $stale = $true
+        if (Test-Path $hubState) {
+            $hs = ConvertFrom-Json ([System.IO.File]::ReadAllText($hubState, [System.Text.Encoding]::UTF8))
+            $lp = $null
+            if ($hs.lastPush -and [datetime]::TryParse([string]$hs.lastPush, [ref]$lp)) {
+                $stale = ((Get-Date) - $lp).TotalSeconds -ge 120
+            }
+        }
+        if ($stale) {
+            Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                (Join-Path $PSScriptRoot 'hub_config.ps1'), '-PushOnly')
+        }
+    } catch { }
+
+    $cfg
+}
+
+# ---------- 强制模式 ----------
+# 强制模式 = config.force 与独立状态文件 force-state.json 双保险:
+# 计划任务(enforcer)每分钟兜底: 任一来源生效则强制屏蔽, 并把另一来源修复一致;
+# 直接手改 config.json 删掉 force 也破不了戒(1 分钟内被 enforcer 恢复)。
+
+function Get-AfsForceStatePath {
+    (Join-Path (Split-Path (Get-AfsConfigPath)) 'force-state.json')
+}
+
+function Read-AfsForceState {
+    $p = Get-AfsForceStatePath
+    if (-not (Test-Path $p)) { return $null }
+    try {
+        ConvertTo-AfsHashtable (ConvertFrom-Json ([System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8)))
+    } catch { $null }
+}
+
+function Save-AfsForceState {
+    param([string]$Until)
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText((Get-AfsForceStatePath), (ConvertTo-Json @{ until = $Until }), $utf8)
+}
+
+function Remove-AfsForceState {
+    $p = Get-AfsForceStatePath
+    if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+}
+
+# 返回 @{ active=$bool; until=$datetime|null } — 仅在屏蔽计划窗口内生效 (时段外不强制)
+function Test-AfsForceActive {
+    param($Config, [datetime]$Now = (Get-Date))
+    if (-not $Config.force.enabled) { return @{ active = $false; until = $null } }
+    # 可选"强制星期"过滤: force.weekdays 非空时仅所选星期强制 (星期语义 1=周一..7=周日, 与屏蔽计划一致)
+    $fWds = @($Config.force.weekdays | Where-Object { $null -ne $_ })
+    if ($fWds.Count -gt 0) {
+        $dayNum = [int]$Now.DayOfWeek
+        if ($dayNum -eq 0) { $dayNum = 7 }
+        if ($fWds -notcontains $dayNum) { return @{ active = $false; until = $null } }
+    }
+    # 强制模式只在用户设置的屏蔽时段内生效: 时段外不强制, 可正常关闭/解除
+    if (-not (Test-AfsInScheduleWindow -Config $Config -Now $Now)) {
+        return @{ active = $false; until = $null }
+    }
+    # 窗口内: 取 config 与独立状态文件两来源较晚的 until (仅用于显示剩余时间/防手改; 不因 until 过期失效)
+    $until = $null
+    if ($Config.force.until) {
+        $t = [datetime]::MinValue
+        if ([datetime]::TryParse([string]$Config.force.until, [ref]$t)) { if ($null -eq $until -or $t -gt $until) { $until = $t } }
+    }
+    $st = Read-AfsForceState
+    if ($st -and $st.until) {
+        $t = [datetime]::MinValue
+        if ([datetime]::TryParse([string]$st.until, [ref]$t)) { if ($null -eq $until -or $t -gt $until) { $until = $t } }
+    }
+    if ($null -eq $until) {
+        # 长期模式(星期循环, 无到期日): config 与状态文件都无 until 时按"持续生效"处理
+        return @{ active = $true; until = $null }
+    }
+    if ($until -lt $Now) { return @{ active = $false; until = $null } }                         # 仅兼容旧式单次强制(带 until)跨天过期: 由引擎自动清理
+    @{ active = $true; until = $until }
+}
+
+# ---------- 卸载守卫 ----------
+# 强制模式期间不允许卸载(防破戒): 开着强制模式 = 自己下的承诺, 承诺期内不能把整套东西拆掉。
+# 判据与强制模式本身同源("双保险"), 任一来源显示"开着"就拦:
+#   1) config.force.enabled
+#   2) force-state.json 存在 (= 曾合法开启且未经面板合法关闭)
+# 于是"手改 config.json 把 force.enabled 改成 false 再卸载"这条绕过路径也被挡住。
+# 返回 @{ blocked; reason = off|force-active|force-on|force-residue; active; until; msg }
+# 卸载守卫: 只在"强制模式此刻正在生效"(所选星期的屏蔽时段内)时拦截。
+# 判据是 Test-AfsForceActive 的实时结果 —— 单纯"开关开着"但当前不在强制时段(窗口外 /
+# 非所选星期)一律放行, 否则周六想卸载也会被拦住。
+# 仍保留一处防篡改: config 显示未开启却残留独立状态文件 = 有人手改配置绕过强制模式 -> 拦。
+function Get-AfsUninstallBlock {
+    param([datetime]$Now = (Get-Date))
+    $res = @{ blocked = $false; reason = 'off'; active = $false; until = $null; msg = '' }
+    $cfg = $null
+    try { $cfg = Get-AfsConfig } catch { return $res }   # 配置都读不出来 => 强制模式本来没在跑, 不必拦(避免卸载被永久卡死)
+    $cfgOn   = [bool]$cfg.force.enabled
+    $stateOn = Test-Path (Get-AfsForceStatePath)
+    if (-not $cfgOn -and -not $stateOn) { return $res }
+
+    # 1) 真正生效中(所选星期的屏蔽时段内) -> 拦
+    $fa = Test-AfsForceActive -Config $cfg -Now $Now
+    if ($fa.active) {
+        $res.blocked = $true
+        $res.active  = $true
+        if ($fa.until) { $res.until = ([datetime]$fa.until).ToString('HH:mm') }
+        $res.reason = 'force-active'
+        $res.msg = "强制模式正在生效中(当前处于屏蔽时段), 已阻止卸载, 程序文件 / 计划任务 / hosts 全部保持原样。请等本次屏蔽时段结束后再执行卸载(若届时仍被拦, 到面板「状态 / 屏蔽计划」页关闭强制模式)。"
+        return $res
+    }
+
+    # 2) 开关开着但此刻不在强制时段(窗口外 / 非所选星期) -> 放行
+    if ($cfgOn) { return $res }
+
+    # 3) config 未开启却残留状态文件 -> 手改配置绕过的痕迹, 仍拦
+    $res.blocked = $true
+    $res.reason = 'force-residue'
+    $res.msg = "检测到强制模式状态文件(force-state.json)残留, 但配置显示强制模式未开启 —— 疑似被手动改过配置文件。为防绕过已阻止卸载。请到面板「状态 / 屏蔽计划」页开启并关闭一次强制模式以清理状态, 再执行卸载。"
+    $res
+}
+
+# ---------- 计划判定 ----------
+
+function ConvertTo-AfsMinutes { param([string]$HHmm)
+    $parts = $HHmm -split ':'
+    [int]$parts[0] * 60 + [int]$parts[1]
+}
+
+# 支持跨午夜: start > end 表示跨夜 (23:00 -> 01:00)
+function Test-AfsInWindow {
+    param([string]$Start, [string]$End, [int]$NowMin)
+    $s = ConvertTo-AfsMinutes $Start
+    $e = ConvertTo-AfsMinutes $End
+    if ($s -eq $e) { return $false }
+    if ($e -gt $s) { return ($NowMin -ge $s) -and ($NowMin -lt $e) }
+    return ($NowMin -ge $s) -or ($NowMin -lt $e)
+}
+
+# 当前时间是否落在屏蔽计划窗口内 (schedule.days + windows, 支持跨午夜)
+# ---------- 学习联动 (读学习台写下的 study.flag) ----------
+# 学习台把"今天的目标是否全部打卡"写到 study.flag; 引擎在这里读。
+# 宁可放行也不锁死: 文件不存在 / JSON 坏 / 不是今天的 / 超过 45 分钟没更新 -> 一律视为"已完成"。
+
+$script:AFS_STUDY_FLAG      = 'study.flag'
+$script:AFS_STUDY_STALE_MIN = 45
+
+function Get-AfsStudyFlagPath { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_STUDY_FLAG) }
+
+function Get-AfsStudyInfo {
+    param([datetime]$Now = (Get-Date))
+    <# ok=$false 表示"读不到可信进度"; 其余字段来自 study.flag #>
+    $p = Get-AfsStudyFlagPath
+    if (-not (Test-Path $p)) { return @{ ok = $false; reason = 'flag-missing' } }
+    try {
+        $j = ConvertFrom-Json ([System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8))
+    } catch { return @{ ok = $false; reason = 'flag-bad-json' } }
+    if (-not $j) { return @{ ok = $false; reason = 'flag-empty' } }
+    if (($j.PSObject.Properties.Name -contains 'error') -and $j.error) {
+        return @{ ok = $false; reason = 'flag-error' }
+    }
+    if ([string]$j.date -ne $Now.ToString('yyyy-MM-dd')) {
+        return @{ ok = $false; reason = 'flag-outdated' }
+    }
+    if (($Now - (Get-Item $p).LastWriteTime).TotalMinutes -gt $script:AFS_STUDY_STALE_MIN) {
+        return @{ ok = $false; reason = 'flag-stale' }
+    }
+    @{
+        ok           = $true
+        allDone      = [bool]$j.allDone
+        pending      = [int]$j.pending
+        pendingNames = @($j.pendingNames)
+        activeCount  = [int]$j.active
+        date         = [string]$j.date
+        checkedAt    = [string]$j.checkedAt
+        lastHitAt    = [string]$j.lastHitAt
+    }
+}
+
+# 只在"读到了可信进度且确实没打完"时返回 $false
+function Test-AfsStudyDone {
+    $s = Get-AfsStudyInfo
+    if (-not $s.ok) { return $true }
+    [bool]$s.allDone
+}
+
+# ---------- 学习联动: 20:00 打卡罚时 (对齐手机端 CheckinPenalty) ----------
+# 每天 20:00 判断: 今天的目标还没按时打完卡 -> 在当天屏蔽结束点之后再接续 30 分钟。
+# 例: 00:00-21:00 + 23:00-00:00 的排法, 放行点是 21:00 -> 延到 21:30 才放行。
+# 两条刻意的取舍(和手机端一致):
+#   · 一天只入账一次(按日期幂等), 否则每次轮询都加一笔, 一天能叠成十几个小时。
+#   · 入账后不撤销: 20:00 之后才把卡补上, 这 30 分钟照样要等 —— 否则"先看会儿手机再打卡"
+#     永远没有代价, 规则等于没有。
+# 读不到可信进度(flag 缺失/损坏/不是今天/超过 45 分钟没更新) 一律不入账, 绝不锁死。
+$script:AFS_CHECKIN_DUE_HOUR   = 20
+$script:AFS_CHECKIN_EXTEND_MIN = 30
+$script:AFS_CHECKIN_PENALTY    = 'checkin-penalty.json'
+
+function Get-AfsCheckinPenaltyPath { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_CHECKIN_PENALTY) }
+
+function Read-AfsCheckinPenalty {
+    $p = Get-AfsCheckinPenaltyPath
+    if (-not (Test-Path $p)) { return $null }
+    try {
+        $j = ConvertFrom-Json ([System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8))
+        if (-not $j) { return $null }
+        @{
+            date    = [string]$j.date
+            armedAt = [string]$j.armedAt
+            release = [string]$j.release
+            until   = [string]$j.until
+            pending = [int]$j.pending
+        }
+    } catch { $null }
+}
+
+function Write-AfsCheckinPenalty {
+    param($Data)
+    try { Write-AfsTextAtomic -Path (Get-AfsCheckinPenaltyPath) -Text (ConvertTo-Json $Data -Compress) } catch { }
+}
+
+# 今天的放行点: schedule.windows 里"结束时刻落在今天"的最晚一个。
+# 跨午夜窗口(23:00->00:00)结束点在次日, 不算今天; 00:00-21:00 的 21:00 照算(今天这一段)。
+function Get-AfsTodayReleasePoint {
+    param($Config, [datetime]$Now = (Get-Date))
+    $best = $null
+    foreach ($w in @($Config.schedule.windows)) {
+        $s = ConvertTo-AfsMinutes ([string]$w.start)
+        $e = ConvertTo-AfsMinutes ([string]$w.end)
+        if ($e -le $s -or $e -ge 1440) { continue }   # 跨午夜 / 起止相同 / 结束于零点: 放行点在次日
+        $cand = Get-Date -Year $Now.Year -Month $Now.Month -Day $Now.Day -Hour ([int][math]::Floor($e / 60)) -Minute ($e % 60) -Second 0 -Millisecond 0
+        if ($null -eq $best -or $cand -gt $best) { $best = $cand }
+    }
+    $best
+}
+
+# 今天算不算"没按时打完卡": 还有 pending, 或最后一笔打卡发生在今天 20:00 之后。
+function Test-AfsCheckinMissed {
+    param($StudyInfo, [datetime]$Now = (Get-Date))
+    if (-not $StudyInfo -or -not $StudyInfo.ok) { return $false }
+    if ([int]$StudyInfo.pending -gt 0) { return $true }
+    $last = [datetime]::MinValue
+    if ([string]$StudyInfo.lastHitAt -and [datetime]::TryParse([string]$StudyInfo.lastHitAt, [ref]$last)) {
+        $due = Get-Date -Year $Now.Year -Month $Now.Month -Day $Now.Day -Hour $script:AFS_CHECKIN_DUE_HOUR -Minute 0 -Second 0 -Millisecond 0
+        if ($last -gt $due) { return $true }
+    }
+    $false
+}
+
+# 每个节拍问一次: 今天这笔 30 分钟该入账了吗。幂等, 同一天重复调用不会再叠第二笔。
+# 返回 $true = 这一次刚刚入账(调用方据此打日志 / 重算冻结)。
+function Invoke-AfsCheckinPenaltyTick {
+    param($Config, [datetime]$Now = (Get-Date))
+    if (-not $Config.studyHold -or -not [bool]$Config.studyHold.enabled) { return $false }
+    if ($Now.Hour -lt $script:AFS_CHECKIN_DUE_HOUR) { return $false }
+    $today = $Now.ToString('yyyy-MM-dd')
+    $old = Read-AfsCheckinPenalty
+    if ($old -and $old.date -eq $today) { return $false }        # 一天只入账一次
+    $info = Get-AfsStudyInfo -Now $Now
+    if (-not $info.ok) { return $false }                          # fail-open
+    if (-not (Test-AfsCheckinMissed -StudyInfo $info -Now $Now)) { return $false }
+    $release = Get-AfsTodayReleasePoint -Config $Config -Now $Now
+    if ($null -eq $release) { return $false }                     # 今天没有可延长的放行点
+    $until = $release.AddMinutes($script:AFS_CHECKIN_EXTEND_MIN)
+    Write-AfsCheckinPenalty -Data @{
+        date    = $today
+        armedAt = $Now.ToString('yyyy-MM-dd HH:mm:ss')
+        release = $release.ToString('yyyy-MM-dd HH:mm')
+        until   = $until.ToString('yyyy-MM-dd HH:mm')
+        pending = [int]$info.pending
+    }
+    $true
+}
+
+# 当前是否处于"20:00 打卡罚时"这一段(只读, 供判定/面板展示)。
+function Get-AfsCheckinPenaltyActive {
+    param($Config, [datetime]$Now = (Get-Date))
+    $off = @{ active = $false; armed = $false; release = ''; until = ''; pending = 0 }
+    if (-not $Config.studyHold -or -not [bool]$Config.studyHold.enabled) { return $off }
+    $p = Read-AfsCheckinPenalty
+    if (-not $p -or $p.date -ne $Now.ToString('yyyy-MM-dd')) { return $off }
+    $rel = [datetime]::MinValue
+    $unt = [datetime]::MinValue
+    if (-not [datetime]::TryParse($p.release, [ref]$rel)) { return $off }
+    if (-not [datetime]::TryParse($p.until, [ref]$unt)) { return $off }
+    @{
+        active  = ($Now -ge $rel -and $Now -lt $unt)
+        armed   = $true
+        release = $p.release
+        until   = $p.until
+        pending = $p.pending
+    }
+}
+
+# 找 Python: 优先 WorkBuddy 内置解释器, 再退回系统安装
+function Get-AfsPythonPath {
+    $cands = @()
+    $root = Join-Path $env:USERPROFILE '.workbuddy\binaries\python\versions'
+    if (Test-Path $root) {
+        $cands += @(Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName 'python.exe' })
+    }
+    $cands += @('C:\Python313\python.exe', 'C:\Python312\python.exe', 'C:\Python311\python.exe')
+    $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($cmd) { $cands += $cmd.Source }
+    foreach ($c in $cands) { if ($c -and (Test-Path $c)) { return $c } }
+    $null
+}
+
+# 跑一次"使用统计上云 + 今日打卡进度"。$Wait=$true 时等它跑完并回传输出。
+# 面板每 15 分钟调用一次; 失败只影响数据新鲜度, 不影响屏蔽本身。
+# 注意: 不能用 Start-Process —— 它重建环境变量字典时, 若 PATH 里同时存在
+# HTTPS_PROXY / https_proxy 这类大小写重名变量会直接抛"已添加项", 进程根本起不来。
+function Invoke-AfsStudySync {
+    param([switch]$Wait)
+    $py = Get-AfsPythonPath
+    if (-not $py) { return @{ ok = $false; error = '找不到 python.exe' } }
+    $runner = Join-Path (Split-Path (Get-AfsConfigPath)) 'study_sync.py'
+    if (-not (Test-Path $runner)) { return @{ ok = $false; error = '找不到 study_sync.py' } }
+
+    if ($Wait) {
+        try {
+            $r = & $py $runner 2>&1
+            $lines = @($r | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
+            return @{ ok = $true; output = @($lines | Select-Object -Last 4) }
+        } catch {
+            return @{ ok = $false; error = $_.Exception.Message }
+        }
+    }
+
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $py
+        $psi.Arguments = '"' + $runner + '"'
+        $psi.UseShellExecute = $false     # 继承当前环境, 不重建字典(避开重名变量崩溃)
+        $psi.CreateNoWindow = $true
+        [void][System.Diagnostics.Process]::Start($psi)
+        return @{ ok = $true; started = $true }
+    } catch {
+        return @{ ok = $false; error = $_.Exception.Message }
+    }
+}
+
+function Test-AfsInScheduleWindow {
+    param($Config, [datetime]$Now = (Get-Date))
+    $dayNum = [int]$Now.DayOfWeek      # 0=周日
+    if ($dayNum -eq 0) { $dayNum = 7 } # 统一成 1=周一 .. 7=周日
+    if (@($Config.schedule.days) -notcontains $dayNum) { return $false }
+    $nowMin = $Now.Hour * 60 + $Now.Minute
+    foreach ($w in @($Config.schedule.windows)) {
+        if (Test-AfsInWindow -Start $w.start -End $w.end -NowMin $nowMin) { return $true }
+    }
+    $false
+}
+
+function Get-AfsActiveState {
+    param($Config, [datetime]$Now = (Get-Date))
+    # 强制模式最高优先级: 生效期间无论如何都屏蔽 (压过 enabled/override/schedule)
+    # ★ -Now 必须传下去: 不传的话 force 永远按真实时钟算,
+    #   "推演某个时刻"(面板算下次屏蔽时间 / 复盘日志)得到的就是错误状态
+    $force = Test-AfsForceActive -Config $Config -Now $Now
+    if ($force.active) { return @{ active = $true; reason = 'force' } }
+
+    if (-not $Config.enabled) { return @{ active = $false; reason = 'disabled' } }
+
+    $ov = $Config.override
+    if ($ov.mode -ne 'none' -and $ov.until) {
+        $until = [datetime]::MinValue   # 必须类型化, 否则 [ref] 无法匹配 TryParse 重载
+        if ([datetime]::TryParse([string]$ov.until, [ref]$until)) {
+            if ($Now -lt $until) {
+                if ($ov.mode -eq 'block') { return @{ active = $true;  reason = 'override-block' } }
+                if ($ov.mode -eq 'off')   { return @{ active = $false; reason = 'override-off' } }
+            }
+        }
+    }
+
+    $dayNum = [int]$Now.DayOfWeek      # 0=周日
+    if ($dayNum -eq 0) { $dayNum = 7 } # 统一成 1=周一 .. 7=周日
+    if (@($Config.schedule.days) -notcontains $dayNum) { return @{ active = $false; reason = 'day' } }
+
+    $nowMin = $Now.Hour * 60 + $Now.Minute
+    foreach ($w in @($Config.schedule.windows)) {
+        if (Test-AfsInWindow -Start $w.start -End $w.end -NowMin $nowMin) {
+            return @{ active = $true; reason = 'schedule' }
+        }
+    }
+    # 20:00 打卡罚时: 当天放行点之后再接续 30 分钟(与手机端 CheckinPenalty 同口径)。
+    # 判定只读已入账的状态(入账由引擎每分钟的 tick 负责), 避免推演时刻污染状态文件。
+    $pen = Get-AfsCheckinPenaltyActive -Config $Config -Now $Now
+    if ($pen.active) { return @{ active = $true; reason = 'study-penalty' } }
+    # 已到解锁时段。学习联动: 今天目标还没全部打卡 -> 继续屏蔽, 不再挑时间段。
+    # 以前这里还要求"当前时刻落在 studyHold.start-end 之内", 结果是区间之外照样放行,
+    # 闸门等于漏的(放行时段没和那个区间重合的应用根本拦不住)。现在只看打完没有。
+    $hold = $Config.studyHold
+    if ($hold -and [bool]$hold.enabled) {
+        if (-not (Test-AfsStudyDone)) { return @{ active = $true; reason = 'study-hold' } }
+    }
+    @{ active = $false; reason = 'time' }
+}
+
+# 下一个屏蔽开始时间 (当前不在屏蔽中时调用); 当前屏蔽中返回 $null
+function Get-AfsNextActiveTime {
+    param($Config, [datetime]$Now = (Get-Date))
+    # 当前正在屏蔽中 -> 没有"下一次"
+    if ((Get-AfsActiveState -Config $Config -Now $Now).active) { return $null }
+    # 候选时刻 = override-off 到期时刻 + 未来各计划窗口的开始时刻
+    # (临时解除 30 分钟但到期时仍在屏蔽窗口内 -> 到期即恢复屏蔽, 不能只找下一个窗口)
+    $cands = New-Object System.Collections.Generic.List[datetime]
+    $ov = $Config.override
+    if ($ov.mode -eq 'off' -and $ov.until) {
+        $u = [datetime]::MinValue
+        if ([datetime]::TryParse([string]$ov.until, [ref]$u) -and $u -gt $Now) { $cands.Add($u) }
+    }
+    for ($d = 0; $d -le 8; $d++) {
+        $day = $Now.AddDays($d)
+        $dayNum = [int]$day.DayOfWeek
+        if ($dayNum -eq 0) { $dayNum = 7 }
+        if (@($Config.schedule.days) -notcontains $dayNum) { continue }
+        foreach ($w in @($Config.schedule.windows)) {
+            $sMin = ConvertTo-AfsMinutes $w.start
+            $eMin = ConvertTo-AfsMinutes $w.end
+            if ($sMin -eq $eMin) { continue }
+            $cand = Get-Date -Year $day.Year -Month $day.Month -Day $day.Day -Hour ([int]($sMin / 60)) -Minute ($sMin % 60) -Second 0
+            if ($cand -gt $Now) { $cands.Add($cand) }
+        }
+    }
+    # 按时间排序, 逐个检查该时刻是否真的进入屏蔽 (override 可能已过期/仍在生效)
+    foreach ($c in ($cands | Sort-Object)) {
+        $s = Get-AfsActiveState -Config $Config -Now $c
+        if ($s.active) { return $c.ToString('yyyy-MM-dd HH:mm') }
+    }
+    $null
+}
+
+# ---------- hosts 操作 ----------
+
+function Get-AfsHostsText {
+    param([string]$Path)
+    if (Test-Path $Path) { [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8) } else { '' }
+}
+
+function Remove-AfsHostsBlockFromText {
+    param([string]$Text)
+    $lines  = $Text -split "`r?`n"
+    $out    = New-Object System.Collections.Generic.List[string]
+    $inBlock = $false
+    foreach ($ln in $lines) {
+        if ($ln.Trim() -eq $script:AFS_MARK_START) { $inBlock = $true; continue }
+        if ($inBlock) {
+            if ($ln.Trim() -eq $script:AFS_MARK_END) { $inBlock = $false }
+            continue
+        }
+        $out.Add($ln)
+    }
+    ($out -join "`r`n").TrimEnd("`r`n")
+}
+
+function Get-AfsHostsState {
+    param([string]$Path)
+    try {
+        $text = Get-AfsHostsText -Path $Path
+        if ($text -match [regex]::Escape($script:AFS_MARK_START)) { return 'blocked' }
+        return 'clean'
+    } catch { return 'error' }
+}
+
+function Set-AfsHostsBlock {
+    param([string[]]$Domains, [string]$Path)
+    $text  = Get-AfsHostsText -Path $Path
+    $clean = Remove-AfsHostsBlockFromText -Text $text
+    $domains = @($Domains | Where-Object { $_ } | Sort-Object -Unique)
+    if ($domains.Count -gt 0) {
+        $lines = New-Object System.Collections.Generic.List[string]
+        $lines.Add($script:AFS_MARK_START)
+        foreach ($d in $domains) {
+            $lines.Add("0.0.0.0 $d")
+            $lines.Add(":: $d")
+        }
+        $lines.Add($script:AFS_MARK_END)
+        $newText = ($clean.TrimEnd("`r`n") + "`r`n" + ($lines -join "`r`n") + "`r`n")
+    } else {
+        $newText = $clean
+    }
+    # 内容没变就不写盘: 引擎每分钟都会跑到这里, 跳过相同内容可避免对系统 hosts 的无谓写入
+    # (自愈能力不受影响 —— 块被人删掉时 newText != text, 仍会重写)
+    if ($newText -ceq $text) { return }
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $newText, $utf8)
+}
+
+function Remove-AfsHostsBlock {
+    param([string]$Path)
+    $text  = Get-AfsHostsText -Path $Path
+    $clean = Remove-AfsHostsBlockFromText -Text $text
+    $newText = $clean + "`r`n"
+    if ($newText -ceq $text) { return }   # 没有块需要移除且格式一致 -> 不写盘
+    $utf8  = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $newText, $utf8)
+}
+
+# ---------- 进程 ----------
+
+function Get-AfsProcessKillList {
+    param($Config)
+    $wl = @($Config.whitelist.processes | Where-Object { $_ } |
+        ForEach-Object { $_.Trim().ToLower() -replace '\.exe$','' })
+    $list = New-Object System.Collections.Generic.List[string]
+    foreach ($p in @($Config.blockedProcesses)) {
+        $name = ($p.Trim() -replace '\.exe$','').ToLower()
+        if (-not $name) { continue }
+        if ($script:AFS_PROTECTED -contains $name) { continue }
+        $skip = $false
+        foreach ($w in $wl) { if ($name -like $w) { $skip = $true; break } }
+        if (-not $skip) { $list.Add($name) }
+    }
+    @($list)
+}
+
+# ---------- 执行 ----------
+
+function Invoke-AfsLocked {
+    param([scriptblock]$Action)
+    $lockPath = $script:AFS_LOCK_PATH
+    for ($i = 0; $i -lt 30; $i++) {
+        try {
+            $fs = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            try { return & $Action } finally { $fs.Close() }
+        } catch { Start-Sleep -Milliseconds 200 }
+    }
+    # 锁只是防御性的: 真拿不到就警告并继续, 不阻塞功能
+    Write-Warning "无法获取锁文件 $lockPath (继续执行, 可能有并发写入)"
+    & $Action
+}
+
+function Set-AfsLog {
+    param([string]$Path, $Log)
+    Write-AfsJson -Path $Path -Object $Log
+}
+
+# ---------- 临时解除(破戒)统计 ----------
+# 统计"取消屏蔽/临时解除"的次数与时长: 每次用户点「临时解除」(override.mode=off)
+# 且当前确实处于解除状态(reason=override-off)时开始计时, 屏蔽恢复/被清除/被强制压过时结算。
+# 数据存独立 stats.json (不写入 config, 不参与云同步); 引擎每分钟运行自然驱动状态机。
+
+$script:AFS_STATS_FILE = 'stats.json'
+$script:AFS_STATS_MAX  = 1000   # 保留事件上限, 超出裁剪最旧
+
+function Get-AfsStatsPath { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_STATS_FILE) }
+
+function Read-AfsStats {
+    $p = Get-AfsStatsPath
+    if (Test-Path $p) {
+        try {
+            $obj = ConvertTo-AfsHashtable (ConvertFrom-Json (Read-AfsTextRetry -Path $p) -ErrorAction Stop)
+            $script:afsStatsCache = $obj
+            return $obj
+        } catch { }
+    }
+    # 文件不存在/暂时读不动 -> 用本进程上次成功读到的内容, 而不是让统计凭空清零
+    if ($script:afsStatsCache) { return $script:afsStatsCache }
+    @{ open = $null; events = @() }
+}
+
+function Save-AfsStats {
+    param($Stats)
+    Write-AfsTextAtomic -Path (Get-AfsStatsPath) -Text (ConvertTo-Json $Stats -Depth 6)
+    $script:afsStatsCache = $Stats
+}
+
+function Format-AfsMinTime { param([datetime]$T) $T.ToString('yyyy-MM-dd HH:mm') }
+
+# 每次屏蔽引擎运行时调用(锁内, 非 Simulate):
+#   进入 override-off -> 开启/延长当前解除会话;
+#   退出 override-off(恢复屏蔽/强制压过/手动清除/总开关关闭) -> 结算一次事件
+function Update-AfsUnlockStats {
+    param($Config, [string]$Reason, [datetime]$Now = (Get-Date))
+    $stats = Read-AfsStats
+    $changed = $false
+    if ($Reason -eq 'override-off') {
+        $untilStr = $null
+        if ($Config.override -and $Config.override.until) {
+            $u = [datetime]::MinValue
+            if ([datetime]::TryParse([string]$Config.override.until, [ref]$u)) { $untilStr = $u.ToString('o') }
+        }
+        if ($null -eq $stats.open) {
+            $stats.open = @{ start = Format-AfsMinTime $Now; until = $untilStr }
+            $changed = $true
+        } elseif ($untilStr -and $stats.open.until -ne $untilStr) {
+            $stats.open.until = $untilStr   # 再次点解除 = 延长本次, 不重复计次
+            $changed = $true
+        }
+    } elseif ($null -ne $stats.open) {
+        $start = [datetime]::MinValue
+        [void][datetime]::TryParse([string]$stats.open.start, [ref]$start)
+        # cap session end at override expiry (until): when the engine was down
+        # (shutdown/sleep) it must not count downtime as unblock time
+        $end = $Now
+        if ($stats.open.until) {
+            $u = [datetime]::MinValue
+            if ([datetime]::TryParse([string]$stats.open.until, [ref]$u) -and $u -lt $end -and $u -gt $start) { $end = $u }
+        }
+        $mins = [Math]::Max(1, [int][Math]::Round(($end - $start).TotalMinutes))
+        $stats.events = @($stats.events + @{
+            start = $stats.open.start
+            end   = Format-AfsMinTime $end
+            min   = $mins
+        })
+        $stats.open = $null
+        $changed = $true
+    }
+    if ($changed) {
+        if (@($stats.events).Count -gt $script:AFS_STATS_MAX) {
+            $stats.events = @($stats.events | Select-Object -Last $script:AFS_STATS_MAX)
+        }
+        Save-AfsStats $stats
+    }
+}
+
+function Clear-AfsStats {
+    $p = Get-AfsStatsPath
+    if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+}
+
+# ---------- 活动时间统计 (ActivityWatch 式) ----------
+# 记录"前台使用时间": 由面板(交互会话)每 60 秒采样一次前台窗口,
+# 进程/站点按天聚合到 activity.json; 超过 3 分钟无键鼠输入视为离开, 不计时。
+# 引擎(S4U 会话)无法访问桌面, 不参与采样。进程分钟数=前台活跃分钟(已剔除离开时间)。
+
+$script:AFS_ACTIVITY_FILE = 'activity.json'
+$script:AFS_ACTIVITY_KEEP  = 60
+
+function Get-AfsActivityPath { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_ACTIVITY_FILE) }
+
+function Read-AfsActivity {
+    param([switch]$Force)
+    # 进程内缓存优先: activity.json 的唯一写入方就是本进程(面板采样), 缓存即权威数据。
+    # 面板长驻, 每分钟采样 + 每次统计页请求都会读它, 缓存优先可省掉全部重复磁盘读取。
+    if (-not $Force -and $script:afsActivityCache) { return $script:afsActivityCache }
+    $p = Get-AfsActivityPath
+    if (Test-Path $p) {
+        try {
+            $obj = ConvertTo-AfsHashtable (ConvertFrom-Json (Read-AfsTextRetry -Path $p) -ErrorAction Stop)
+            $script:afsActivityCache = $obj
+            return $obj
+        } catch { }
+    }
+    if ($script:afsActivityCache) { return $script:afsActivityCache }
+    @{ version = 1; days = @{} }
+}
+
+function Save-AfsActivity {
+    param($Activity)
+    Write-AfsTextAtomic -Path (Get-AfsActivityPath) -Text (ConvertTo-Json $Activity -Depth 12)
+    $script:afsActivityCache = $Activity
+}
+
+# Win32: 前台窗口 / 全局输入空闲检测 (需交互会话)
+$csNative = @(
+    '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();'
+    '[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);'
+    '[DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO info);'
+    'public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }'
+)
+try { Add-Type -Namespace AfsWin32 -Name Native -MemberDefinition ($csNative -join "`n") -ErrorAction Stop } catch { }
+
+function Get-AfsIdleSeconds {
+    try {
+        $i = New-Object AfsWin32.Native+LASTINPUTINFO
+        $i.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type][AfsWin32.Native+LASTINPUTINFO])
+        if ([AfsWin32.Native]::GetLastInputInfo([ref]$i)) {
+            $now = [uint32][Environment]::TickCount
+            $diff = [int]($now - $i.dwTime)
+            if ($diff -lt 0) { $diff = 0 }
+            return [int]($diff / 1000)
+        }
+    } catch { }
+    return 0
+}
+
+$script:AFS_SITE_WORDS = @('bilibili','youtube','douyin','tiktok','instagram','kuaishou','weibo','zhihu','reddit','pinterest','snapchat','huya','twitch','xiaohongshu','tieba','xiaoheihe','b23','acfun')
+
+function Invoke-AfsActivitySample {
+    $a = Read-AfsActivity
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+    # 离开 / 无前台窗口 / 取不到进程时数据没有任何变化 —— 直接返回, 不再每分钟把整份 json 重写一遍
+    if (-not $a.days.ContainsKey($today)) { $a.days[$today] = @{ apps = @{}; sites = @{} } }
+    if ((Get-AfsIdleSeconds) -gt 180) { return }
+    $hwnd = [AfsWin32.Native]::GetForegroundWindow()
+    if ($hwnd -eq [IntPtr]::Zero) { return }
+    $wp = [uint32]0
+    [void][AfsWin32.Native]::GetWindowThreadProcessId($hwnd, [ref]$wp)
+    $proc = Get-Process -Id $wp -ErrorAction SilentlyContinue
+    if (-not $proc) { return }
+    $app = $proc.ProcessName
+    if (-not $app) { return }
+    $title = ''
+    try { $title = [string]$proc.MainWindowTitle } catch { }
+    $d = $a.days[$today]
+    if (-not $d.apps.ContainsKey($app)) { $d.apps[$app] = 0 }
+    $d.apps[$app] = [int]$d.apps[$app] + 1
+    if ($app -in @('msedge','chrome','firefox','opera','brave','vivaldi') -and $title) {
+        $tl = $title.ToLower()
+        foreach ($w in $script:AFS_SITE_WORDS) {
+            if ($tl -like "*$w*") {
+                if (-not $d.sites.ContainsKey($w)) { $d.sites[$w] = 0 }
+                $d.sites[$w] = [int]$d.sites[$w] + 1
+                break
+            }
+        }
+    }
+    $keys = @($a.days.Keys | Sort-Object -Descending)
+    if ($keys.Count -gt $script:AFS_ACTIVITY_KEEP) {
+        foreach ($k in $keys | Select-Object -Skip $script:AFS_ACTIVITY_KEEP) { $a.days.Remove($k) }
+    }
+    Save-AfsActivity $a
+}
+# ---------- 浏览器窗口(工作区)屏蔽 ----------
+# 屏蔽时优雅关闭标题匹配的浏览器窗口(例如 Edge 的"娱乐"工作区), 其他窗口/工作区不受影响。
+# 关闭动作必须跑在用户交互会话里(S4U 计划任务无法操作桌面窗口),
+# 所以由 AwayFromShorts-BrowserClose 交互计划任务执行 close-browser-windows.ps1。
+# 附加 urlBlock: 用 Edge/Chrome 的 URLBlocklist 注册表策略在导航层拦截 blockedSites 域名,
+# 与代理/DNS 无关无法绕过; 策略变更需重启浏览器生效。
+
+$script:AFS_BROWSER_TASK  = 'AwayFromShorts-BrowserClose'
+$script:AFS_BROWSER_CLOSE = 'browser-close.json'
+$script:AFS_BROWSER_STATE = 'browser-state.json'
+$script:AFS_BROWSER_RESTART = 'browser-restart.json'
+# 去抖窗口：策略一改就重启浏览器，短时间内来回改会把窗口全打散。
+# 8 分钟内的第二次重启直接跳过 —— 浏览器下次启动自然会读到新策略。
+$script:AFS_RESTART_GAP_MIN = 8
+$script:AFS_BROWSER_RESTART_PENDING = 'browser-restart.pending.json'
+
+function Get-AfsBrowserClosePath  { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_BROWSER_CLOSE) }
+function Get-AfsBrowserStatePath { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_BROWSER_STATE) }
+function Get-AfsBrowserRestartPath { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_BROWSER_RESTART) }
+function Get-AfsBrowserPendingPath { (Join-Path (Split-Path (Get-AfsConfigPath)) $script:AFS_BROWSER_RESTART_PENDING) }
+
+# 去抖窗口内被挡掉的那次重启不是"取消"，是"欠着"：记一个标记，等窗口过去再补。
+# 不补的话，屏蔽重新开启时浏览器还在用旧策略 —— 对自律工具来说等于放行，不能接受。
+function Set-AfsBrowserRestartPending {
+    try {
+        $o = @{ since = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') }
+        [System.IO.File]::WriteAllText((Get-AfsBrowserPendingPath), (ConvertTo-Json $o),
+            (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+
+function Clear-AfsBrowserRestartPending {
+    # 删不掉也不能把调用方打断：残留一个 pending 最坏是 8 分钟后再重启一次，
+    # 而抛异常会让"已排上队"被误判成"没排上"，下一分钟又排一遍。
+    try {
+        $p = Get-AfsBrowserPendingPath
+        if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+    } catch { }
+}
+
+# 引擎每分钟调一次：欠着的重启到点就补队列（最多晚 1 分钟）
+function Invoke-AfsBrowserPendingRestart {
+    param($Config)
+    try {
+        if (-not (Test-Path (Get-AfsBrowserPendingPath))) { return $false }
+        if (-not (Test-AfsBrowserRestartAllowed)) { return $false }
+        [void](Invoke-AfsBrowserWindowClose -Config $Config -RestartAll)
+        return $true
+    } catch { return $false }
+}
+
+# 上次真正重启的时间由 close-browser-windows.ps1 在重开窗口前写入。
+# 读不到/解析失败一律当作"可以重启"（宁可重启一次，也别让策略永远不生效）。
+function Test-AfsBrowserRestartAllowed {
+    param([int]$MinGapMin = $script:AFS_RESTART_GAP_MIN)
+    $p = Get-AfsBrowserRestartPath
+    if (-not (Test-Path $p)) { return $true }
+    try {
+        $o = ConvertFrom-Json ([System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8))
+        $t = [datetime]::MinValue
+        if ([datetime]::TryParse([string]$o.lastRestart, [ref]$t)) {
+            return (((Get-Date) - $t).TotalMinutes -ge $MinGapMin)
+        }
+    } catch { }
+    $true
+}
+
+function Read-AfsBrowserState {
+    $p = Get-AfsBrowserStatePath
+    if (Test-Path $p) {
+        try { return ConvertTo-AfsHashtable (ConvertFrom-Json ([System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8))) } catch { }
+    }
+    @{ applied = $false }
+}
+
+function Save-AfsBrowserState {
+    param([bool]$Applied, [string]$Signature = '')
+    $obj = @{ applied = $Applied }
+    if ($Signature) { $obj.signature = $Signature }
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText((Get-AfsBrowserStatePath), (ConvertTo-Json $obj), $utf8)
+}
+
+# 浏览器策略内容指纹: URLBlocklist + URLAllowlist 的最终模式集拼接后取哈希。
+# 用于判断"策略内容是否变化" —— 旧版只看 applied 布尔量, 配置改了却不会刷新策略。
+function Get-AfsBrowserPolicySignature {
+    param($Config)
+    $sites   = @($Config.blockedSites | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
+    $wlSites = @($Config.whitelist.sites | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
+    $wlPlainHosts = @($wlSites | ForEach-Object {
+        $p = Parse-AfsSiteEntry -Entry $_
+        if ($p.valid -and -not $p.isPath) { $p.host }
+    } | Where-Object { $_ } | Select-Object -Unique)
+    $toBlock = @($sites | Where-Object {
+        $bp = Parse-AfsSiteEntry -Entry $_
+        -not ($bp.valid -and -not $bp.isPath -and $wlPlainHosts -contains $bp.host)
+    })
+    $all = @(ConvertTo-AfsUrlPatterns -Domains $toBlock) + @(ConvertTo-AfsUrlPatterns -Domains $wlSites)
+    # 指纹必须包含目标浏览器列表: 只改 browser.targets(比如新加 chrome)时也要触发重写,
+    # 否则 Edge 的策略签名不变 → Chrome 永远拿不到 URLBlocklist。
+    $targets = @($Config.browser.targets | ForEach-Object { ([string]$_).Trim().ToLower() } |
+        Where-Object { $_ } | Sort-Object -Unique)
+    $joined = (@($all | Sort-Object -Unique) -join "`n") + "`n#targets:" + ($targets -join ',')
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    $hash = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($joined))
+    (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+# 域名/路径列表 -> URLBlocklist 通配符模式
+# 纯域名 "a.com"        -> *://a.com/*  +  *://*.a.com/*   (覆盖子域)
+# 路径项 "a.com/video/*" -> *://a.com/video/*  (不做子域通配: 路径规则应精确到该主机)
+function ConvertTo-AfsUrlPatterns {
+    param($Domains)
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($d in @($Domains)) {
+        $p = Parse-AfsSiteEntry -Entry ([string]$d)
+        if (-not $p.valid) { continue }
+        if ($p.isPath) {
+            # 路径模式: 只针对该主机 (含 * 主机则原样)
+            $out.Add("*://$($p.host)$($p.path)")
+        } else {
+            $out.Add("*://$($p.host)/*")
+            $out.Add("*://*.$($p.host)/*")
+        }
+    }
+    @($out | Select-Object -Unique)
+}
+
+function Get-AfsBrowserPolicyPaths {
+    param($Targets)
+    $map = @{ edge = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; chrome = 'HKLM:\SOFTWARE\Policies\Google\Chrome' }
+    @($Targets | ForEach-Object { if ($map.ContainsKey($_)) { $map[$_] } } | Select-Object -Unique)
+}
+
+# 写入 URL 拦截策略, 返回拦截域名数
+# 白名单语义(关键):
+#   纯域名白名单 "a.com"      -> 把 blockedSites 里同域名的项整体剔除(全站放行)
+#   路径白名单 "a.com/video/*" -> 不剔除任何屏蔽项, 只作为 URLAllowlist 精细放行该路径
+#   (放行依赖 Edge 的"最长路径优先"与"平局 allowlist 胜"规则, 见官方 filter 格式文档)
+function Set-AfsBrowserPolicy {
+    param($Config)
+    $sites   = @($Config.blockedSites | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
+    $wlSites = @($Config.whitelist.sites | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
+
+    # 只有"纯域名"形态的白名单才剔除屏蔽项
+    $wlPlainHosts = @($wlSites | ForEach-Object {
+        $p = Parse-AfsSiteEntry -Entry $_
+        if ($p.valid -and -not $p.isPath) { $p.host }
+    } | Where-Object { $_ } | Select-Object -Unique)
+    $toBlock = @($sites | Where-Object {
+        $bp = Parse-AfsSiteEntry -Entry $_
+        -not ($bp.valid -and -not $bp.isPath -and $wlPlainHosts -contains $bp.host)
+    })
+
+    $blockPatterns = ConvertTo-AfsUrlPatterns -Domains $toBlock
+    $allowPatterns = ConvertTo-AfsUrlPatterns -Domains $wlSites
+    foreach ($root in Get-AfsBrowserPolicyPaths -Targets $Config.browser.targets) {
+        New-Item -Path $root -Force | Out-Null
+        Remove-Item (Join-Path $root 'URLBlocklist') -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $root 'URLAllowlist') -Recurse -Force -ErrorAction SilentlyContinue
+        if ($blockPatterns.Count) {
+            $bk = Join-Path $root 'URLBlocklist'
+            New-Item -Path $bk -Force | Out-Null
+            for ($i = 0; $i -lt $blockPatterns.Count; $i++) {
+                New-ItemProperty -Path $bk -Name ([string]($i + 1)) -Value $blockPatterns[$i] -PropertyType String -Force | Out-Null
+            }
+        }
+        if ($allowPatterns.Count) {
+            $ak = Join-Path $root 'URLAllowlist'
+            New-Item -Path $ak -Force | Out-Null
+            for ($i = 0; $i -lt $allowPatterns.Count; $i++) {
+                New-ItemProperty -Path $ak -Name ([string]($i + 1)) -Value $allowPatterns[$i] -PropertyType String -Force | Out-Null
+            }
+        }
+    }
+    $toBlock.Count
+}
+
+function Remove-AfsBrowserPolicy {
+    param($Config)
+    foreach ($root in Get-AfsBrowserPolicyPaths -Targets $Config.browser.targets) {
+        Remove-Item (Join-Path $root 'URLBlocklist') -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $root 'URLAllowlist') -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# 触发浏览器交互任务: 写载荷(browser-close.json) + 幂等创建任务 + /Run
+# RestartAll: 关闭所有浏览器窗口后重新打开 (URLBlocklist 变更后重启使策略生效)
+function Invoke-AfsBrowserWindowClose {
+    param($Config, [switch]$RestartAll)
+    # 去抖：只有「重启浏览器」这个动作需要，按标题关窗口(每分钟)不受影响。
+    # 返回 $false 表示这次没排重启，调用方会把原因写进日志。
+    if ($RestartAll -and -not (Test-AfsBrowserRestartAllowed)) {
+        Set-AfsBrowserRestartPending
+        return $false
+    }
+    # 只按用户配置的窗口标题(工作区名, 如"娱乐")关闭窗口 —— 刻意不做"标题含屏蔽站点名"兜底:
+    # 那会把普通工作窗口(如在工作区看 B 站教程/知乎)一并误关; 导航层拦截由 urlBlock 负责。
+    $payload = @{
+        patterns   = @($Config.browser.windows | Where-Object { $Config.browser.enabled -and $_ })
+        targets    = @($Config.browser.targets)
+        restartAll = [bool]$RestartAll
+    }
+    Write-AfsJson -Path (Get-AfsBrowserClosePath) -Object $payload
+    # payload 落盘 = 已经排上队（任务自己每分钟也会触发一次），欠账到此结清。
+    # 不能等 schtasks /Run 成功才清：Run 失败不代表排不上队，清了才不会每分钟重排。
+    if ($RestartAll) { Clear-AfsBrowserRestartPending }
+    # 用 wscript.exe + VBS 隐藏启动 (GUI 子系统, 无控制台窗口) —— 直接跑 powershell 即使 -WindowStyle Hidden
+    # 控制台分配瞬间仍会闪黑窗, 这是"每分钟闪弹窗"的根因
+    $vbsPath = Join-Path (Split-Path (Get-AfsConfigPath)) 'close-browser.vbs'
+    # 任务已存在就不重建: 引擎活跃期每分钟都会走到这里, 每分钟重写 XML + /Create /F 纯属浪费
+    # (任务被删掉时查询失败 -> 照样重建, 自愈能力保留)
+    $taskExists = $false
+    try {
+        $q = schtasks /Query /TN $script:AFS_BROWSER_TASK 2>&1
+        $taskExists = (($q | Out-String) -notmatch 'ERROR|错误')
+    } catch { $taskExists = $false }
+    if (-not $taskExists) {
+    # 用 XML 创建任务: 必须关闭电池限制 (DisallowStartIfOnBatteries/StopIfGoingOnBatteries=false),
+    # 否则笔记本用电池时任务不启动, 窗口屏蔽会静默失效 (schtasks /SC ONCE 默认电池限制为 true)
+    # InteractiveToken: 交互会话才能关闭桌面窗口; 不存密码
+    $xml = '<?xml version="1.0" encoding="UTF-16"?>' + "`r`n" +
+           '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">' + "`r`n" +
+           '  <RegistrationInfo>' + "`r`n" +
+           '    <Date>' + (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss') + '</Date>' + "`r`n" +
+           '    <Author>AwayFromShorts</Author>' + "`r`n" +
+           '    <URI>\' + $script:AFS_BROWSER_TASK + '</URI>' + "`r`n" +
+           '  </RegistrationInfo>' + "`r`n" +
+           '  <Principals>' + "`r`n" +
+           '    <Principal id="Author">' + "`r`n" +
+           '      <LogonType>InteractiveToken</LogonType>' + "`r`n" +
+           '    </Principal>' + "`r`n" +
+           '  </Principals>' + "`r`n" +
+           '  <Settings>' + "`r`n" +
+           '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>' + "`r`n" +
+           '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>' + "`r`n" +
+           '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>' + "`r`n" +
+           '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>' + "`r`n" +
+           '    <IdleSettings>' + "`r`n" +
+           '      <StopOnIdleEnd>false</StopOnIdleEnd>' + "`r`n" +
+           '    </IdleSettings>' + "`r`n" +
+           '  </Settings>' + "`r`n" +
+           '  <Triggers>' + "`r`n" +
+           '    <TimeTrigger>' + "`r`n" +
+           '      <StartBoundary>' + (Get-Date -Format 'yyyy-MM-dd') + 'T00:00:00</StartBoundary>' + "`r`n" +
+           '      <Repetition>' + "`r`n" +
+           '        <Interval>PT1M</Interval>' + "`r`n" +
+           '        <StopAtDurationEnd>false</StopAtDurationEnd>' + "`r`n" +
+           '      </Repetition>' + "`r`n" +
+           '    </TimeTrigger>' + "`r`n" +
+           '  </Triggers>' + "`r`n" +
+           '  <Actions Context="Author">' + "`r`n" +
+           '    <Exec>' + "`r`n" +
+           '      <Command>"wscript.exe"</Command>' + "`r`n" +
+           '      <Arguments>"' + $vbsPath + '"</Arguments>' + "`r`n" +
+           '    </Exec>' + "`r`n" +
+           '  </Actions>' + "`r`n" +
+           '</Task>'
+    $xmlPath = Join-Path $env:TEMP 'afs-browserclose-task.xml'
+    # schtasks /XML 要求 UTF-16 编码
+    [System.IO.File]::WriteAllText($xmlPath, $xml, [System.Text.Encoding]::Unicode)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & schtasks /Create /F /TN $script:AFS_BROWSER_TASK /XML $xmlPath *> $null } catch { }
+    Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
+    $ErrorActionPreference = $prev
+    }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    # schtasks 被安全策略拦时是终止性错误：吞掉它，payload 已经写好，任务下一分钟自己会跑
+    try { & schtasks /Run /TN $script:AFS_BROWSER_TASK *> $null } catch { }
+    $ErrorActionPreference = $prev
+    return $true
+}
+
+function Remove-AfsBrowserClose {
+    $p = Get-AfsBrowserClosePath
+    if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+}
+
+# 核心: 根据配置执行一次屏蔽/解除
+function Invoke-AfsEnforce {
+    param(
+        $Config,
+        [string]$HostsPath,
+        [switch]$Simulate,
+        [string]$LogPath
+    )
+    # 20:00 打卡罚时: 每分钟问一次(幂等, 一天只入账一次)。必须放在取状态之前,
+    # 否则 20:00 这一拍拿到的还是入账前的状态。干跑(Simulate)不写状态文件。
+    if (-not $Simulate) {
+        try { Invoke-AfsCheckinPenaltyTick -Config $Config | Out-Null } catch { }
+    }
+    $state  = Get-AfsActiveState -Config $Config
+    $active = $state.active
+    # ---- 强制模式: 开启后当天内不可关闭, 到期自动解除 (不自动续期到下一天) ----
+    $forceActive = Test-AfsForceActive -Config $Config
+    if ($forceActive.active) {
+        # 生效中: 补齐独立状态文件 (防手改 json / 删文件破戒)
+        # 注意 until 可能为 $null(长期模式), 直接 .ToString() 会抛异常 -> 那样删掉状态文件就修补不回来了
+        if (-not (Test-Path (Get-AfsForceStatePath))) {
+            $untilStr = if ($forceActive.until) { ([datetime]$forceActive.until).ToString('o') } else { $null }
+            Save-AfsForceState -Until $untilStr
+        }
+    } elseif ($Config.force.enabled) {
+        # 未生效: 仅旧式单次强制(until 非空且已跨天过期)自动关闭;
+        # 长期模式(until 为空 = 星期循环)不自动解除, 保留到用户手动关闭(非强制时段可关)
+        $expired = $false
+        if ($Config.force.until) {
+            $fU = [datetime]::MinValue
+            $expired = -not [datetime]::TryParse([string]$Config.force.until, [ref]$fU) -or $fU -lt (Get-Date)
+        }
+        if ($expired) {
+            $Config.force.enabled = $false
+            $Config.force.until  = $null
+            if (-not $Simulate) { Set-AfsConfigSafe -InputConfig $Config | Out-Null }
+            Remove-AfsForceState
+        }
+        # 长期或窗口外未过期: 保留配置, 进入所选星期的屏蔽窗口时自动生效
+    }
+    $log = @{
+        time   = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        active = $active
+        reason = $state.reason
+        hosts  = 'clean'
+        killed = @()
+        browser = 'off'
+    }
+    try {
+        # 上一轮被去抖挡掉的重启，到点补上（最多晚 1 分钟）
+        if (-not $Simulate) { [void](Invoke-AfsBrowserPendingRestart -Config $Config) }
+        if ($active) {
+            if ($Config.blockWebsites) {
+                # hosts 只能表达"域名级"拦截。为支持"整站屏蔽 + 路径放行", 这里做区分:
+                #   纯域名屏蔽项(a.com)            -> 进 hosts 整站封
+                #   路径屏蔽项(a.com/video/*)      -> 主机让出 hosts, 改由 URLBlocklist 路径规则处理
+                #   纯域名白名单(a.com)            -> 该主机整体放行, 不进 hosts
+                #   ⚠️ 只要某主机存在"路径级"规则(屏蔽或白名单), 该主机就不进 hosts —— 否则
+                #      DNS 被指向 0.0.0.0, 浏览器根本连不上, URLBlocklist 的路径例外永远没机会生效。
+                $wlPlain = @($Config.whitelist.sites | ForEach-Object {
+                    $p = Parse-AfsSiteEntry -Entry ([string]$_)
+                    if ($p.valid -and -not $p.isPath) { $p.host }
+                } | Where-Object { $_ } | Select-Object -Unique)
+                $wlPathHosts = @($Config.whitelist.sites | ForEach-Object {
+                    $p = Parse-AfsSiteEntry -Entry ([string]$_)
+                    if ($p.valid -and $p.isPath) { $p.host }
+                } | Where-Object { $_ } | Select-Object -Unique)
+                $toBlock = @($Config.blockedSites | ForEach-Object {
+                    $p = Parse-AfsSiteEntry -Entry ([string]$_)
+                    if (-not $p.valid -or -not $p.host) { return }
+                    if ($p.isPath) { return }                             # 路径项: 交给 URLBlocklist
+                    if ($wlPlain -contains $p.host) { return }            # 纯域名白名单: 整站放行
+                    if ($wlPathHosts -contains $p.host) { return }        # 该主机有路径级白名单: 让出 hosts
+                    $p.host
+                } | Where-Object { $_ } | Select-Object -Unique)
+                if ($Simulate) {
+                    $log.hosts = "simulate-block($($toBlock.Count) domains)"
+                } else {
+                    Set-AfsHostsBlock -Domains $toBlock -Path $HostsPath
+                    $log.hosts = "blocked($($toBlock.Count) domains)"
+                }
+            }
+            if (-not $Simulate) {
+                $killList = Get-AfsProcessKillList -Config $Config
+                # 显式进程黑名单优先于窗口规则; 只有未列入黑名单的浏览器才按标题关闭。
+                $killed = New-Object System.Collections.Generic.List[string]
+                foreach ($n in $killList) {
+                    foreach ($pr in @(Get-Process -Name $n -ErrorAction SilentlyContinue)) {
+                        try {
+                            Stop-Process -Id $pr.Id -Force -ErrorAction Stop
+                            $killed.Add("$n($($pr.Id))")
+                        } catch { }
+                    }
+                }
+                $log.killed = @($killed | Select-Object -Unique)
+            }
+
+            # 浏览器窗口(工作区)屏蔽: 每分钟触发关闭匹配窗口 (用户重开也会再关)
+            if (-not $Simulate -and ($Config.browser.enabled -or $Config.browser.urlBlock -or @($killList | Where-Object { $_ -in @('chrome','msedge') }).Count -gt 0)) {
+                Invoke-AfsBrowserWindowClose -Config $Config
+                $log.browser = "window-block($(@($Config.browser.windows | Where-Object { $_ }).Count) patterns)"
+            } elseif (-not $Simulate) {
+                Remove-AfsBrowserClose
+            }
+            # 附加 URL 拦截 (URLBlocklist): 状态机 + 内容指纹
+            #   仅在 开启/关闭 转变 或 策略内容变化 时写策略 + 重启浏览器。
+            #   (旧版只看 applied 布尔量, 导致"改了域名/白名单但策略不刷新" —— 浏览器一直用旧规则)
+            $bState = Read-AfsBrowserState
+            if ($Config.browser.urlBlock) {
+                if ($Simulate) { $log.browser = 'simulate-urlblock' }
+                else {
+                    $curSig = Get-AfsBrowserPolicySignature -Config $Config
+                    $needWrite = (-not $bState.applied) -or ([string]$bState.signature -ne $curSig)
+                    if ($needWrite) {
+                        $n = Set-AfsBrowserPolicy -Config $Config
+                        Save-AfsBrowserState -Applied $true -Signature $curSig
+                        $log.browser = "url-block($n domains)"
+                        if (-not (Invoke-AfsBrowserWindowClose -Config $Config -RestartAll)) { $log.browser += ", restart-debounced" }
+                    }
+                }
+            } elseif ($bState.applied) {
+                if ($Simulate) { $log.browser = 'simulate-urlclean' }
+                else {
+                    Remove-AfsBrowserPolicy -Config $Config
+                    Save-AfsBrowserState -Applied $false
+                    $log.browser = 'url-clean'
+                    if (-not (Invoke-AfsBrowserWindowClose -Config $Config -RestartAll)) { $log.browser += ', restart-debounced' }
+                }
+            }
+        } else {
+            if ($Simulate) {
+                $log.hosts = 'simulate-clean'
+            } else {
+                Remove-AfsHostsBlock -Path $HostsPath
+                $log.hosts = 'clean'
+            }
+
+            # 解除: 移除 URL 拦截策略并重启浏览器恢复; 停止窗口关闭
+            $bState = Read-AfsBrowserState
+            if ($bState.applied) {
+                if ($Simulate) { $log.browser = 'simulate-urlclean' }
+                else {
+                    Remove-AfsBrowserPolicy -Config $Config
+                    Save-AfsBrowserState -Applied $false
+                    $log.browser = 'url-clean'
+                    if (-not (Invoke-AfsBrowserWindowClose -Config $Config -RestartAll)) { $log.browser += ', restart-debounced' }
+                }
+            }
+            if (-not $Simulate) { Remove-AfsBrowserClose }
+        }
+        # 过期 override 自动清理
+        if ($Config.override.mode -ne 'none' -and $Config.override.until) {
+            $until = [datetime]::MinValue   # 必须类型化, 否则 [ref] 无法匹配 TryParse 重载
+            if ([datetime]::TryParse([string]$Config.override.until, [ref]$until)) {
+                if ((Get-Date) -ge $until) {
+                    $Config.override.mode  = 'none'
+                    $Config.override.until = $null
+                    if (-not $Simulate) { Set-AfsConfigSafe -InputConfig $Config }
+                }
+            }
+        }
+    } catch {
+        $log.error = $_.Exception.Message
+    }
+    # 解除统计状态机 (非干跑): 观察 override-off 进入/退出
+    if (-not $Simulate) { Update-AfsUnlockStats -Config $Config -Reason $state.reason }
+    if ($LogPath) { Set-AfsLog -Path $LogPath -Log $log }
+    $log
+}
+
+# ---------- 计划任务信息 ----------
+
+function Get-AfsTaskInfo {
+    # 30s TTL 缓存: /api/status 被面板每 20s 轮询, 每次都 spawn schtasks (100~300ms) 会拖慢单线程服务。
+    # 任务注册/卸载是低频操作, 30s 内的状态滞后可接受。
+    $nowSec = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if ($script:afsTaskInfoCache -and ($nowSec - [int]$script:afsTaskInfoCacheAt) -lt 30) {
+        return $script:afsTaskInfoCache
+    }
+    $ErrorActionPreference = 'Continue'   # 任务不存在时 schtasks 会写 stderr, 不能被 Stop 变成终止错误
+    $out = schtasks /Query /TN "AwayFromShorts" 2>&1
+    $text = ($out | Out-String)
+    if ($text -match 'ERROR|错误') {
+        $script:afsTaskInfoCache = @{ exists = $false }
+        $script:afsTaskInfoCacheAt = $nowSec
+        return $script:afsTaskInfoCache
+    }
+    $status = 'unknown'
+    foreach ($line in $out) {
+        if ($line -match '^\s*(正在运行|Running)' -or $line -match '正在运行') { $status = 'running'; break }
+        if ($line -match '^\s*(就绪|Ready)') { $status = 'ready' }
+    }
+    $script:afsTaskInfoCache = @{ exists = $true; status = $status }
+    $script:afsTaskInfoCacheAt = $nowSec
+    $script:afsTaskInfoCache
+}
+
+# ---------- 云同步 (GitHub Gist) ----------
+# 登录 = 保存 GitHub Personal Access Token (DPAPI 加密, 仅当前 Windows 用户可解)
+# 配置通过私有 Gist 同步, 支持多设备共用一份配置
+# 安全: Token 只发给 api.github.com, 绝不写入配置文件/日志/Gist
+
+$script:AFS_API_BASE  = 'https://api.github.com'
+$script:AFS_GIST_DESC = 'AwayFromShorts 配置同步'
+$script:AFS_GIST_FILE = 'config.json'
+
+function Get-AfsSyncDir { (Split-Path (Get-AfsConfigPath)) }
+function Get-AfsTokenPath { Join-Path (Get-AfsSyncDir) 'github-token.enc' }
+function Get-AfsSyncStatePath { Join-Path (Get-AfsSyncDir) 'sync-state.json' }
+
+# 保存 Token: ConvertFrom-SecureString 默认用 DPAPI(当前用户+机器), 密文落盘
+function Save-AfsGitHubToken {
+    param([string]$Token)
+    if (-not $Token) { throw 'Token 不能为空' }
+    $sec = ConvertTo-SecureString $Token -AsPlainText -Force
+    $enc = ConvertFrom-SecureString $sec
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText((Get-AfsTokenPath), $enc, $utf8)
+}
+
+function Get-AfsGitHubToken {
+    $p = Get-AfsTokenPath
+    if (-not (Test-Path $p)) { return $null }
+    try {
+        . (Join-Path (Split-Path $p -Parent) 'token.ps1')
+        return Get-AfsGithubTokenText -Path $p
+    } catch { return $null }
+}
+
+function Clear-AfsGitHubToken {
+    $p = Get-AfsTokenPath
+    if (Test-Path $p) { Remove-Item $p -Force }
+    $s = Get-AfsSyncStatePath
+    if (Test-Path $s) { Remove-Item $s -Force }
+}
+
+function Get-AfsSyncState {
+    $p = Get-AfsSyncStatePath
+    if (Test-Path $p) {
+        try { return ConvertTo-AfsHashtable (ConvertFrom-Json ([System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8))) } catch { }
+    }
+    @{ gistId = $null; lastSync = $null; autoPush = $false }
+}
+
+function Save-AfsSyncState {
+    param($State)
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText((Get-AfsSyncStatePath), (ConvertTo-Json $State -Depth 6), $utf8)
+}
+
+# GitHub API 封装: 强制 TLS1.2, 统一错误处理 (401/403/404 转成中文信息)
+function Invoke-AfsGitHubApi {
+    param([string]$Method, [string]$Path, $Body, [string]$Token, [int]$TimeoutSec = 20)
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol =
+            [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+    } catch { }
+    $headers = @{
+        'Authorization' = 'token ' + $Token
+        'Accept'        = 'application/vnd.github+json'
+        'User-Agent'    = 'AwayFromShorts/' + $script:AFS_VERSION
+    }
+    $params = @{ Method = $Method; Uri = $script:AFS_API_BASE + $Path; Headers = $headers; TimeoutSec = $TimeoutSec; ErrorAction = 'Stop' }
+    if ($null -ne $Body) { $params.Body = $Body; $params.ContentType = 'application/json; charset=utf-8' }
+    try {
+        $resp = Invoke-RestMethod @params
+        ConvertTo-AfsHashtable $resp
+    } catch {
+        $msg = $_.Exception.Message
+        $code = $null
+        if ($_.Exception -is [System.Net.WebException] -and $_.Exception.Response) {
+            try {
+                $rs = $_.Exception.Response
+                $code = [int]$rs.StatusCode
+                $reader = New-Object System.IO.StreamReader($rs.GetResponseStream())
+                $raw = $reader.ReadToEnd()
+                $parsed = $raw | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($parsed -and $parsed.message) { $msg = $parsed.message }
+            } catch { }
+        }
+        if ($code -eq 401) { throw "GitHub 认证失败(401): Token 无效或已过期" }
+        if ($code -eq 403) { throw "GitHub 拒绝访问(403): $msg" }
+        if ($code -eq 404) { throw "GitHub 资源不存在(404): $msg" }
+        throw "GitHub API 请求失败: $msg"
+    }
+}
+
+# 验证 Token 并返回用户信息 (login/name/email)
+# 注意: 会联网。面板首屏加载绝不能走这里(单线程 HTTP 服务, 一次 20s 卡顿会让整页空白),
+#       登录/同步这类用户主动操作用它, 其余走 Get-AfsAccountInfo 的本地缓存。
+function Get-AfsGitHubUser {
+    param([string]$Token, [int]$TimeoutSec = 20)
+    Invoke-AfsGitHubApi -Method 'GET' -Path '/user' -Token $Token -TimeoutSec $TimeoutSec
+}
+
+# 把 GitHub 用户信息缓存进 sync-state, 供面板离线读取
+function Save-AfsAccountCache {
+    param($User)
+    if (-not $User) { return }
+    try {
+        $state = Get-AfsSyncState
+        $state.login = $User.login
+        $state.name = $User.name
+        $state.email = $User.email
+        Save-AfsSyncState $state
+    } catch { }
+}
+
+function Test-AfsGitHubToken {
+    param([string]$Token)
+    try { $u = Get-AfsGitHubUser -Token $Token; return $true } catch { return $false }
+}
+
+# 同步内容 = 完整配置去掉临时 override(跨设备不该带"临时屏蔽"状态)
+function ConvertTo-AfsSyncPayload {
+    $cfg = Get-AfsConfig
+    $clean = @{}
+    foreach ($k in $cfg.Keys) { if ($k -ne 'override') { $clean[$k] = $cfg[$k] } }
+    ConvertTo-Json $clean -Depth 12
+}
+
+# 在账号的 Gist 列表里找同步 Gist (按 description 匹配), 找不到返回 $null
+function Find-AfsSyncGist {
+    param([string]$Token)
+    $gists = Invoke-AfsGitHubApi -Method 'GET' -Path '/gists?per_page=100' -Token $Token
+    foreach ($g in @($gists)) {
+        if ($g.description -eq $script:AFS_GIST_DESC) { return $g.id }
+    }
+    return $null
+}
+
+# 推送本机配置到私有 Gist (没有则创建, 有则更新)
+function Push-AfsSyncConfig {
+    param([string]$Token)
+    $state = Get-AfsSyncState
+    $gistId = $state.gistId
+    if (-not $gistId) { $gistId = Find-AfsSyncGist -Token $Token }
+    $content = ConvertTo-AfsSyncPayload
+    if ($gistId) {
+        $body = @{ files = @{ $script:AFS_GIST_FILE = @{ content = $content } } } | ConvertTo-Json -Depth 8
+        Invoke-AfsGitHubApi -Method 'PATCH' -Path ('/gists/' + $gistId) -Token $Token -Body $body
+    } else {
+        $body = @{
+            description = $script:AFS_GIST_DESC
+            public      = $false
+            files       = @{ $script:AFS_GIST_FILE = @{ content = $content } }
+        } | ConvertTo-Json -Depth 8
+        $new = Invoke-AfsGitHubApi -Method 'POST' -Path '/gists' -Token $Token -Body $body
+        $gistId = $new.id
+    }
+    $state.gistId = $gistId
+    $state.lastSync = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    Save-AfsSyncState $state
+    $state
+}
+
+# 从云端 Gist 拉取配置覆盖本机 (覆盖前自动备份)
+function Pull-AfsSyncConfig {
+    param([string]$Token)
+    # 强制模式开启期间禁止从云端覆盖本地配置(防破戒: 拉取会覆盖本机屏蔽名单 / 屏蔽时段, 等于绕过强制)
+    if ([bool](Get-AfsConfig).force.enabled) {
+        throw "强制模式开启中, 无法从云端拉取配置(防破戒: 拉取会覆盖本机屏蔽名单 / 时段)。请先关闭强制模式, 再同步。"
+    }
+    $state = Get-AfsSyncState
+    $gistId = $state.gistId
+    if (-not $gistId) { $gistId = Find-AfsSyncGist -Token $Token }
+    if (-not $gistId) { throw '云端没有找到同步配置(请先在其他设备上推送一次)' }
+    $gist = Invoke-AfsGitHubApi -Method 'GET' -Path ('/gists/' + $gistId) -Token $Token
+    $file = $gist.files[$script:AFS_GIST_FILE]
+    if (-not $file -or -not $file.content) { throw '云端 Gist 中没有 config.json' }
+    $cfgPath = Get-AfsConfigPath
+    $bak = $null
+    if (Test-Path $cfgPath) {
+        $bak = $cfgPath + '.backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+        Copy-Item $cfgPath $bak -Force
+    }
+    $parsed = ConvertTo-AfsHashtable (ConvertFrom-Json $file.content -ErrorAction Stop)
+    $newCfg = Set-AfsConfigSafe -InputConfig $parsed
+    $state.gistId = $gistId
+    $state.lastSync = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    Save-AfsSyncState $state
+    @{ config = $newCfg; backup = $bak }
+}
+
+# 给面板用的账号信息 (无 Token / Token 失效都返回可序列化的结构)
+function Get-AfsAccountInfo {
+    param([switch]$Refresh)
+    $token = Get-AfsGitHubToken
+    if (-not $token) { return @{ loggedIn = $false } }
+    $state = Get-AfsSyncState
+    # 优先用本地缓存: 面板每次打开都会调它, 联网会让单线程服务卡住整个首屏
+    $hasCache = [bool]$state.login
+    if ($Refresh -or -not $hasCache) {
+        try {
+            $u = Get-AfsGitHubUser -Token $token -TimeoutSec 6
+            Save-AfsAccountCache $u
+            $state = Get-AfsSyncState
+        } catch {
+            if (-not $hasCache) { return @{ loggedIn = $false; error = $_.Exception.Message } }
+            # 有缓存 → 离线可读, 忽略这次网络失败
+        }
+    }
+    @{
+        loggedIn = $true
+        login    = $state.login
+        name     = $state.name
+        email    = $state.email
+        gistId   = $state.gistId
+        lastSync = $state.lastSync
+        autoPush = [bool]$state.autoPush
+    }
+}
