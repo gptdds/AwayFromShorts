@@ -2,8 +2,8 @@
 
 > 远离短视频成瘾 —— 在指定时间屏蔽网站和程序,并提供一个可视化网页随时调整规则。
 
-[![Release](https://img.shields.io/github/v/release/sdgfdii/AwayFromShorts?label=release)](https://github.com/sdgfdii/AwayFromShorts/releases/latest)
-[![License](https://img.shields.io/github/license/sdgfdii/AwayFromShorts)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/gptdds/AwayFromShorts?label=release)](https://github.com/gptdds/AwayFromShorts/releases/latest)
+[![License](https://img.shields.io/github/license/gptdds/AwayFromShorts)](LICENSE)
 
 **English:** [README.en.md](README.en.md)
 
@@ -40,7 +40,7 @@
 手机上没有任何"网站屏蔽"能拦住抖音 App 本身 —— hosts / DNS 对原生 App 基本无效,
 只有在系统层面把 App 冻住才行。这部分已经拆成独立仓库:
 
-**[sdgfdii/AwayFromShorts-Phone](https://github.com/sdgfdii/AwayFromShorts-Phone)**
+**[gptdds/AwayFromShorts-Phone](https://github.com/gptdds/AwayFromShorts-Phone)**
 
 - **Device Owner 版**:到点系统级冻结,图标变灰、强停和卸载点不动、安全模式进不去、改系统时间也没用
 - **无障碍版**:一进前台就送回桌面,装完即用,但用户能在设置里关掉
@@ -54,19 +54,19 @@
 
 **最简单: 下载单文件 EXE,双击,点一下 UAC「是」,完事。** 不需要解压、不需要命令行:
 
-- 到 [Releases](https://github.com/sdgfdii/AwayFromShorts/releases/latest) 下载 `AwayFromShorts-Setup-2.1.3.exe`
+- 到 [Releases](https://github.com/gptdds/AwayFromShorts/releases/latest) 下载 `AwayFromShorts-Setup-2.1.3.exe`
 - 双击运行 → 弹 UAC 请求管理员权限 → 自动: 解压内置包 → 安装到 `%LOCALAPPDATA%\AwayFromShorts` → 备份 hosts → 注册计划任务(每分钟,最高权限,**不登录也运行**)→ **设置开机自启**(登录自动启动面板,不闪窗口)→ 立即执行一次 → 打开配置面板
 - 完成弹窗提示安装成功,浏览器自动打开 **http://127.0.0.1:8737**
 
 **或者用 PowerShell 一行安装(懒人包):**
 
 ```powershell
-irm https://raw.githubusercontent.com/sdgfdii/AwayFromShorts/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/gptdds/AwayFromShorts/main/install.ps1 | iex
 ```
 
 脚本会自动下载最新懒人包 → 解压 → 弹 UAC 请求管理员权限 → 注册计划任务 → 打开配置面板。
 
-> 手动方式: 在 [Releases](https://github.com/sdgfdii/AwayFromShorts/releases) 下载 `AwayFromShorts-vX.Y.Z-win64.zip`,解压后**右键 `install.bat` → 以管理员身份运行**。
+> 手动方式: 在 [Releases](https://github.com/gptdds/AwayFromShorts/releases) 下载 `AwayFromShorts-vX.Y.Z-win64.zip`,解压后**右键 `install.bat` → 以管理员身份运行**。
 
 ## 🖥 使用
 
@@ -206,7 +206,7 @@ AwayFromShorts/
 └── tools/                 # 前端 / 样式离线校验
 ```
 
-手机端(Android)不在这个仓库 —— 见 [AwayFromShorts-Phone](https://github.com/sdgfdii/AwayFromShorts-Phone)。
+手机端(Android)不在这个仓库 —— 见 [AwayFromShorts-Phone](https://github.com/gptdds/AwayFromShorts-Phone)。
 
 ## ❓ 常见问题
 
