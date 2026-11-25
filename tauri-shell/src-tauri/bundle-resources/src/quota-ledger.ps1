@@ -73,64 +73,189 @@ function Save-AfsQuotaLanConfig {
     }
 }
 
-# Phone slice. A ledger entry from another day is worthless: leaving it in place
-# would charge yesterday's minutes to today's pool right after midnight.
-function Read-AfsQuotaLanState {
-    param([string]$DataDir, [datetime]$Now)
-    $path = Get-AfsQuotaLanStatePath $DataDir
-    $today = Get-AfsQuotaDayKey $Now
-    $state = @{ date = $today; phoneUsedSeconds = 0.0; phoneGroup = ''; phoneApps = @(); updatedAt = '' }
-    if (-not (Test-Path -LiteralPath $path)) { return $state }
-    try {
-        $raw = Read-AfsJson -Path $path
-        if ([string]$raw.date -ne $today) { return $state }
-        $used = 0.0
-        if (-not [double]::TryParse([string]$raw.phoneUsedSeconds, [ref]$used)) { return $state }
-        if ([double]::IsNaN($used) -or [double]::IsInfinity($used) -or $used -lt 0) { return $state }
-        $state.phoneUsedSeconds = [Math]::Min($used, 86400.0)
-        $state.phoneGroup = [string]$raw.phoneGroup
-        $state.updatedAt = [string]$raw.updatedAt
-        # Per-app detail is optional: an older phone build posts only usedSeconds,
-        # so a missing array must not invalidate the slice itself.
-        $apps = @()
-        if ($raw.ContainsKey('phoneApps') -and $null -ne $raw.phoneApps) {
-            foreach ($a in @($raw.phoneApps)) {
-                if ($null -eq $a) { continue }
-                $name = ([string]$a.name).Trim()
-                if (-not $name -or $name.Length -gt 64) { continue }
-                $sec = 0.0
-                if (-not [double]::TryParse([string]$a.seconds, [ref]$sec)) { continue }
-                if ([double]::IsNaN($sec) -or [double]::IsInfinity($sec) -or $sec -le 0) { continue }
-                $apps += @{ name = $name; seconds = [Math]::Min($sec, 86400.0) }
-                if ($apps.Count -ge 30) { break }
-            }
-        }
-        $state.phoneApps = $apps
-    } catch { }
-    $state
-}
-
-function Write-AfsQuotaLanState {
-    param([string]$DataDir, [datetime]$Now, [double]$PhoneUsedSeconds, [string]$PhoneGroup, $PhoneApps = @())
-    $used = [Math]::Max(0.0, [Math]::Min([double]$PhoneUsedSeconds, 86400.0))
-    $apps = @()
-    foreach ($a in @($PhoneApps)) {
+function ConvertTo-AfsQuotaLanApps {
+    param($Apps = @())
+    $out = @()
+    foreach ($a in @($Apps)) {
         if ($null -eq $a) { continue }
         $name = ([string]$a.name).Trim()
         if (-not $name -or $name.Length -gt 64) { continue }
         $sec = 0.0
         if (-not [double]::TryParse([string]$a.seconds, [ref]$sec)) { continue }
         if ([double]::IsNaN($sec) -or [double]::IsInfinity($sec) -or $sec -le 0) { continue }
-        $apps += @{ name = $name; seconds = [Math]::Round([Math]::Min($sec, 86400.0), 1) }
-        if ($apps.Count -ge 30) { break }
+        $out += @{ name = $name; seconds = [Math]::Round([Math]::Min($sec, 86400.0), 1) }
+        if ($out.Count -ge 30) { break }
     }
+    @($out)
+}
+
+function New-AfsQuotaLanPoolState {
+    @{ phoneUsedSeconds = 0.0; phoneGroup = ''; phoneApps = @(); updatedAt = '' }
+}
+
+# Shared cells are read straight from the quota config. quota-ledger.ps1 is also
+# loaded by the LAN helper on its own, so this deliberately stays dependency-free.
+function Get-AfsQuotaSharedRules {
+    param([string]$DataDir)
+    $path = Join-Path $DataDir 'game-quota-config.json'
+    $out = @()
+    if (-not (Test-Path -LiteralPath $path)) { return @() }
+    try {
+        $cfg = Read-AfsJson -Path $path
+        foreach ($rule in @($cfg.rules)) {
+            if ($null -eq $rule -or -not $rule.ContainsKey('shared') -or -not [bool]$rule.shared) { continue }
+            $id = [string]$rule.id
+            if (-not $id) { continue }
+            $minutes = 0
+            if (-not [int]::TryParse([string]$rule.dailyMinutes, [ref]$minutes) -or $minutes -lt 1) { $minutes = 120 }
+            $out += @{
+                id = $id
+                name = '跨设备格子 ' + ($out.Count + 1)
+                type = [string]$rule.type
+                dailyMinutes = $minutes
+                processes = @($rule.processes | Where-Object { $_ })
+                websites = @($rule.websites | Where-Object { $_ })
+            }
+        }
+    } catch { }
+    @($out)
+}
+
+# Phone slice. A ledger entry from another day is worthless: leaving it in place
+# would charge yesterday's minutes to today's pool right after midnight.
+#
+# state:
+#   { date, pools: { "<pc-rule-id>": { phoneUsedSeconds, phoneGroup, phoneApps, updatedAt } } }
+# The old top-level single-pool fields are still read/written for compatibility
+# with older phone builds and older state files.
+function Read-AfsQuotaLanState {
+    param([string]$DataDir, [datetime]$Now)
+    $path = Get-AfsQuotaLanStatePath $DataDir
+    $today = Get-AfsQuotaDayKey $Now
+    $empty = New-AfsQuotaLanPoolState
+    $state = @{
+        date = $today
+        pools = @{}
+        phoneUsedSeconds = 0.0
+        phoneGroup = ''
+        phoneApps = @()
+        updatedAt = ''
+    }
+    if (-not (Test-Path -LiteralPath $path)) { return $state }
+    try {
+        $raw = Read-AfsJson -Path $path
+        if ([string]$raw.date -ne $today) { return $state }
+        $legacy = New-AfsQuotaLanPoolState
+        $legacyOk = $false
+        $used = 0.0
+        if ([double]::TryParse([string]$raw.phoneUsedSeconds, [ref]$used) -and
+            -not [double]::IsNaN($used) -and -not [double]::IsInfinity($used) -and $used -ge 0) {
+            $legacy.phoneUsedSeconds = [Math]::Min($used, 86400.0)
+            $legacy.phoneGroup = [string]$raw.phoneGroup
+            $legacy.phoneApps = @(ConvertTo-AfsQuotaLanApps $raw.phoneApps)
+            $legacy.updatedAt = [string]$raw.updatedAt
+            $legacyOk = $true
+        }
+        if ($raw.ContainsKey('pools') -and $null -ne $raw.pools) {
+            foreach ($id in @($raw.pools.Keys)) {
+                $p = $raw.pools[$id]
+                if ($null -eq $p) { continue }
+                $u = 0.0
+                if (-not [double]::TryParse([string]$p.phoneUsedSeconds, [ref]$u)) { continue }
+                if ([double]::IsNaN($u) -or [double]::IsInfinity($u) -or $u -lt 0) { continue }
+                $state.pools[[string]$id] = @{
+                    phoneUsedSeconds = [Math]::Min($u, 86400.0)
+                    phoneGroup = [string]$p.phoneGroup
+                    phoneApps = @(ConvertTo-AfsQuotaLanApps $p.phoneApps)
+                    updatedAt = [string]$p.updatedAt
+                }
+            }
+        }
+        # Old state files have no pools map. Keep the slice under a sentinel and
+        # let the first shared rule claim it when the view is built.
+        if ($legacyOk -and $state.pools.Count -eq 0) { $state.pools[''] = $legacy }
+        $first = $null
+        if ($state.pools.ContainsKey('')) { $first = $state.pools[''] }
+        elseif ($state.pools.Count -gt 0) {
+            foreach ($id in @($state.pools.Keys)) { $first = $state.pools[$id]; break }
+        }
+        if ($null -ne $first) {
+            $state.phoneUsedSeconds = [double]$first.phoneUsedSeconds
+            $state.phoneGroup = [string]$first.phoneGroup
+            $state.phoneApps = @($first.phoneApps)
+            $state.updatedAt = [string]$first.updatedAt
+        }
+    } catch { }
+    $state
+}
+
+function Get-AfsQuotaLanPoolState {
+    param([hashtable]$State, [string]$PoolId, [switch]$AllowLegacy)
+    if ($State.pools.ContainsKey([string]$PoolId)) { return $State.pools[[string]$PoolId] }
+    if ($AllowLegacy -and $State.pools.ContainsKey('')) { return $State.pools[''] }
+    New-AfsQuotaLanPoolState
+}
+
+# Merge reports into the per-pool state. A report only replaces its own pool;
+# other pools and their phone slices stay untouched.
+function Get-AfsQuotaSharedUsage {
+    param([string]$DataDir, [datetime]$Now, [object[]]$Rules)
+    $pools = @{}
+    $sharedRules = @($Rules | Where-Object { $_.shared })
+    if ($sharedRules.Count -eq 0 -or -not (Get-AfsQuotaLanConfig $DataDir).enabled) { return $pools }
+    $state = Read-AfsQuotaLanState $DataDir $Now
+    $legacyAvailable = $state.pools.ContainsKey('')
+    foreach ($rule in $sharedRules) {
+        $id = [string]$rule.id
+        $allowLegacy = $legacyAvailable -and -not $state.pools.ContainsKey($id)
+        $pool = Get-AfsQuotaLanPoolState -State $state -PoolId $id -AllowLegacy:$allowLegacy
+        if ($allowLegacy) { $legacyAvailable = $false }
+        $pools[$id] = @{usedSeconds=[double]$pool.phoneUsedSeconds; minutes=[int]$rule.dailyMinutes}
+    }
+    return $pools
+}
+
+function Write-AfsQuotaLanPools {
+    param([string]$DataDir, [datetime]$Now, [hashtable]$Reports)
+    $state = Read-AfsQuotaLanState $DataDir $Now
+    foreach ($id in @($Reports.Keys)) {
+        $r = $Reports[$id]
+        if ($null -eq $r) { continue }
+        $used = [Math]::Max(0.0, [Math]::Min([double]$r.phoneUsedSeconds, 86400.0))
+        $state.pools[[string]$id] = @{
+            phoneUsedSeconds = $used
+            phoneGroup = [string]$r.phoneGroup
+            phoneApps = @(ConvertTo-AfsQuotaLanApps $r.phoneApps)
+            updatedAt = $Now.ToString('o')
+        }
+    }
+    # Keep the legacy top-level copy pointed at a deterministic first pool.
+    $first = $null
+    if ($state.pools.ContainsKey('')) { $first = $state.pools[''] }
+    elseif ($state.pools.Count -gt 0) {
+        foreach ($id in @($state.pools.Keys)) { $first = $state.pools[$id]; break }
+    }
+    if ($null -eq $first) { $first = New-AfsQuotaLanPoolState }
     Write-AfsJson -Path (Get-AfsQuotaLanStatePath $DataDir) -Object @{
-        date             = (Get-AfsQuotaDayKey $Now)
-        phoneUsedSeconds = $used
-        phoneGroup       = [string]$PhoneGroup
-        phoneApps        = @($apps)
-        updatedAt        = $Now.ToString('o')
+        date = (Get-AfsQuotaDayKey $Now)
+        pools = $state.pools
+        phoneUsedSeconds = [double]$first.phoneUsedSeconds
+        phoneGroup = [string]$first.phoneGroup
+        phoneApps = @($first.phoneApps)
+        updatedAt = [string]$first.updatedAt
     }
+}
+
+# Compatibility wrapper used by older tests and callers.
+function Write-AfsQuotaLanState {
+    param([string]$DataDir, [datetime]$Now, [double]$PhoneUsedSeconds, [string]$PhoneGroup, $PhoneApps = @(), [string]$PoolId = '')
+    $reports = @{}
+    $reports[[string]$PoolId] = @{
+        phoneUsedSeconds = $PhoneUsedSeconds
+        phoneGroup = $PhoneGroup
+        phoneApps = $PhoneApps
+    }
+    Write-AfsQuotaLanPools -DataDir $DataDir -Now $Now -Reports $reports
 }
 
 # Human label for a quota target id. Only used for the per-app detail rows, so a
@@ -141,6 +266,7 @@ function Get-AfsQuotaTargetLabel {
     if ($Id -eq 'valorant') { return '无畏契约' }
     if ($Id -eq 'steam') { return 'Steam' }
     if ($Id -like 'process:*') { return $Id.Substring(8) }
+    if ($Id -like 'website:*') { return $Id.Substring(8) }
     if (-not $Id) { return '未命名' }
     $Id
 }
@@ -149,34 +275,32 @@ function Get-AfsQuotaTargetLabel {
 # quota-rules.ps1 -- duplicated on purpose so this file stays loadable on its own).
 function Get-AfsQuotaRuleTargetIds {
     param($Rule)
-    if ([string]$Rule.type -eq 'games') {
-        $ids = @('valorant', 'steam')
-        foreach ($p in @($Rule.processes | Where-Object { $_ })) { $ids += ('process:' + [string]$p) }
-        return @($ids | Select-Object -Unique)
+    if ($Rule.type -eq 'games') { 'valorant'; 'steam' }
+    elseif ($Rule.type -ne 'shared') { [string]$Rule.id }
+    foreach ($processName in @($Rule.processes | Where-Object { $_ } | Select-Object -Unique)) {
+        'process:' + $processName
     }
-    @([string]$Rule.id)
+    foreach ($website in @($Rule.websites | Where-Object { $_ } | Select-Object -Unique)) {
+        'website:' + $website
+    }
 }
 
-# Sum of the seconds the PC spent inside the shared pool today.
-function Get-AfsQuotaPcSharedUsed {
+# PC slice for every shared rule. Each rule is its own independent pool.
+function Get-AfsQuotaPcSharedByRule {
     param([string]$DataDir, [datetime]$Now)
-    $total = 0.0
-    $limits = @()
-    $detail = @()
+    $out = @{}
     $gameCfgPath = Join-Path $DataDir 'game-quota-config.json'
     $statePath = Join-Path $DataDir 'game-quota-state.json'
-    if (-not (Test-Path -LiteralPath $gameCfgPath) -or -not (Test-Path -LiteralPath $statePath)) {
-        return @{ used = 0.0; minutes = 0; apps = @() }
-    }
+    $rules = Get-AfsQuotaSharedRules $DataDir
+    foreach ($rule in @($rules)) { $out[[string]$rule.id] = @{ used = 0.0; minutes = [int]$rule.dailyMinutes; apps = @() } }
+    if (-not (Test-Path -LiteralPath $statePath) -or $rules.Count -eq 0) { return $out }
     try {
-        $cfg = Read-AfsJson -Path $gameCfgPath
         $state = Read-AfsJson -Path $statePath
-        if ([string]$state.date -ne (Get-AfsQuotaDayKey $Now)) { return @{ used = 0.0; minutes = 0; apps = @() } }
+        if ([string]$state.date -ne (Get-AfsQuotaDayKey $Now)) { return $out }
         $entries = $state.apps
-        foreach ($rule in @($cfg.rules)) {
-            if ($null -eq $rule -or -not $rule.ContainsKey('shared') -or -not [bool]$rule.shared) { continue }
-            if ($null -eq $rule.id) { continue }
-            $limits += [int]$rule.dailyMinutes
+        foreach ($rule in @($rules)) {
+            $total = 0.0
+            $detail = @()
             foreach ($id in @(Get-AfsQuotaRuleTargetIds $rule)) {
                 $seconds = 0.0
                 if ($state.targets -and $state.targets.ContainsKey($id)) {
@@ -188,11 +312,25 @@ function Get-AfsQuotaPcSharedUsed {
                 $total += $seconds
                 $detail += @{ name = (Get-AfsQuotaTargetLabel $id); seconds = [Math]::Round($seconds, 1) }
             }
+            $out[[string]$rule.id] = @{ used = $total; minutes = [int]$rule.dailyMinutes; apps = @($detail) }
         }
     } catch { }
+    $out
+}
+
+# Aggregate compatibility wrapper.
+function Get-AfsQuotaPcSharedUsed {
+    param([string]$DataDir, [datetime]$Now)
+    $byRule = Get-AfsQuotaPcSharedByRule $DataDir $Now
+    $total = 0.0
+    $apps = @()
     $minutes = 0
-    if ($limits.Count -gt 0) { $minutes = $limits[0] }
-    @{ used = $total; minutes = $minutes; apps = @($detail) }
+    foreach ($id in @($byRule.Keys)) {
+        if ($minutes -le 0) { $minutes = [int]$byRule[$id].minutes }
+        $total += [double]$byRule[$id].used
+        $apps += @($byRule[$id].apps)
+    }
+    @{ used = $total; minutes = $minutes; apps = @($apps) }
 }
 
 # Phone slice is only trusted while it keeps arriving: the phone polls every 3s,
@@ -207,34 +345,77 @@ function Get-AfsQuotaPhoneOnline {
     } catch { return $false }
 }
 
-# Everything the phone needs in one shot. Called once per poll, so it stays
-# deliberately allocation-light: two small JSON reads, no scanning.
+# Everything the phone needs in one shot. The top-level fields mirror the first
+# pool for older APKs; new APKs use the pools array and select by rule id.
 function Get-AfsQuotaPoolView {
     param([string]$DataDir, [datetime]$Now)
     $cfg = Get-AfsQuotaLanConfig $DataDir
     $state = Read-AfsQuotaLanState $DataDir $Now
-    $pc = Get-AfsQuotaPcSharedUsed $DataDir $Now
-    $minutes = if ($pc.minutes -gt 0) { [int]$pc.minutes } else { [int]$cfg.poolMinutes }
-    $limit = $minutes * 60.0
-    $phone = [double]$state.phoneUsedSeconds
-    $pcUsed = [double]$pc.used
-    $total = $pcUsed + $phone
-    @{
+    $pcByRule = Get-AfsQuotaPcSharedByRule $DataDir $Now
+    $rules = @(Get-AfsQuotaSharedRules $DataDir)
+    $pools = @()
+    $firstPool = $null
+    $index = 0
+    foreach ($rule in $rules) {
+        $pc = $pcByRule[[string]$rule.id]
+        if ($null -eq $pc) { $pc = @{ used = 0.0; minutes = [int]$rule.dailyMinutes; apps = @() } }
+        $phoneState = Get-AfsQuotaLanPoolState -State $state -PoolId ([string]$rule.id) -AllowLegacy:($index -eq 0)
+        $minutes = if ([int]$pc.minutes -gt 0) { [int]$pc.minutes } else { [int]$rule.dailyMinutes }
+        $limit = $minutes * 60.0
+        $phoneUsed = [double]$phoneState.phoneUsedSeconds
+        $pcUsed = [double]$pc.used
+        $total = $pcUsed + $phoneUsed
+        $pool = @{
+            id          = [string]$rule.id
+            name        = [string]$rule.name
+            poolMinutes = $minutes
+            limitSec    = $limit
+            pcUsed      = $pcUsed
+            phoneUsed   = $phoneUsed
+            total       = $total
+            remaining   = [Math]::Max(0.0, $limit - $total)
+            exhausted   = (($limit - $total) -le 0)
+            pcApps      = @($pc.apps)
+            phoneApps   = @($phoneState.phoneApps)
+            phoneGroup  = [string]$phoneState.phoneGroup
+            phoneAt     = [string]$phoneState.updatedAt
+            phoneOnline = (Get-AfsQuotaPhoneOnline -UpdatedAt $phoneState.updatedAt -Now $Now)
+            updatedAt   = $Now.ToString('o')
+        }
+        $pools += $pool
+        if ($null -eq $firstPool) { $firstPool = $pool }
+        $index++
+    }
+    $firstId = ''
+    if ($null -ne $firstPool) { $firstId = [string]$firstPool.id }
+    $sharedIds = @($pools | ForEach-Object { [string]$_.id })
+    $view = @{
         date        = (Get-AfsQuotaDayKey $Now)
         enabled     = [bool]$cfg.enabled
-        poolMinutes = $minutes
-        limitSec    = $limit
-        pcUsed      = $pcUsed
-        phoneUsed   = $phone
-        total       = $total
-        remaining   = [Math]::Max(0.0, $limit - $total)
-        exhausted   = (($limit - $total) -le 0)
-        # 双端明细：各端自己那一份花在哪些应用/进程上。只用于展示，不参与判定。
-        pcApps      = @($pc.apps)
-        phoneApps   = @($state.phoneApps)
-        phoneGroup  = [string]$state.phoneGroup
-        phoneAt     = [string]$state.updatedAt
-        phoneOnline = (Get-AfsQuotaPhoneOnline -UpdatedAt $state.updatedAt -Now $Now)
+        pools       = @($pools)
+        sharedRule  = $firstId
+        sharedRules = $sharedIds
         updatedAt   = $Now.ToString('o')
     }
+    # Legacy single-pool fields. Keep them when no shared rule exists as well;
+    # old phone builds then see the fallback pool size instead of an empty view.
+    if ($null -ne $firstPool) {
+        foreach ($key in @('poolMinutes','limitSec','pcUsed','phoneUsed','total','remaining','exhausted','pcApps','phoneApps','phoneGroup','phoneAt','phoneOnline')) {
+            $view[$key] = $firstPool[$key]
+        }
+    } else {
+        $view.poolMinutes = [int]$cfg.poolMinutes
+        $view.limitSec = [double]$cfg.poolMinutes * 60.0
+        $view.pcUsed = 0.0
+        $view.phoneUsed = 0.0
+        $view.total = 0.0
+        $view.remaining = $view.limitSec
+        $view.exhausted = $false
+        $view.pcApps = @()
+        $view.phoneApps = @()
+        $view.phoneGroup = ''
+        $view.phoneAt = ''
+        $view.phoneOnline = $false
+    }
+    $view
 }

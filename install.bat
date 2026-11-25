@@ -23,6 +23,9 @@ if not exist "%APP%" mkdir "%APP%"
 if not exist "%APP%\src" mkdir "%APP%\src"
 copy /y "%SRC%src\core.ps1"             "%APP%\src\" >nul
 copy /y "%SRC%src\awayfromshorts.ps1"   "%APP%\src\" >nul
+copy /y "%SRC%src\game-quota.ps1" "%APP%\src\" >nul
+copy /y "%SRC%src\quota-rules.ps1" "%APP%\src\" >nul
+copy /y "%SRC%src\register-game-quota-task.ps1" "%APP%\src\" >nul
 copy /y "%SRC%src\webui.ps1"            "%APP%\src\" >nul
 copy /y "%SRC%src\uninstall.ps1"        "%APP%\src\" >nul
 copy /y "%SRC%src\register-task.ps1"    "%APP%\src\" >nul
@@ -64,6 +67,7 @@ REM 清理旧的启动文件夹 VBS 自启(避免重复弹 UAC)
 if exist "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\AwayFromShorts-WebUI.vbs" del /q "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\AwayFromShorts-WebUI.vbs" >nul
 
 echo [5/5] 立即执行一次屏蔽检查
+if exist "%APP%\src\game-quota-config.json" powershell -NoProfile -ExecutionPolicy Bypass -File "%APP%\src\register-game-quota-task.ps1"
 powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%APP%\src\awayfromshorts.ps1"
 
 echo [6/6] 启动可视化配置面板

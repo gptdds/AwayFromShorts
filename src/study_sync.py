@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """一条命令跑完学习联动的三件事（供面板定时调用）。
 
-    1. sync_activity.py  面板的使用统计 → 云端「专注记录」表（学习台读它）
+    0. sync_ledger.py    PC 本地学习库 ↔ 手机 Gist 台账（三方合并）
+    1. sync_activity.py  面板的使用统计 → 本地专注记录
     2. check_study.py    今天的学习目标是否都打卡 → study.flag（屏蔽闸门读它）
        ★ 2026-10-23 起台账读 Gist 中心的 checkin-ledger.json（手机 StudyStore 直推），
          云资料库降级为后备；apply_checkins.py 的"队列→代记"链路整体退役。
@@ -35,6 +36,7 @@ def has_error_field(tail: str) -> bool:
 
 # (文件名, 解释器)；runner=None 用当前 python，"powershell" 用 PowerShell 跑 ps1
 STEPS = (
+    ("sync_ledger.py", None),
     ("sync_activity.py", None),
     ("check_study.py", None),
     ("push_gist.ps1", "powershell"),
@@ -68,7 +70,8 @@ def main() -> int:
             log("skip %s (not found)" % name)
             continue
         if runner == "powershell":
-            cmd = ["powershell.exe", "-NoProfile", "-NonInteractive",
+            ps = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+            cmd = [ps, "-NoProfile", "-NonInteractive",
                    "-ExecutionPolicy", "Bypass", "-File", path]
         else:
             cmd = [sys.executable, path]
@@ -92,4 +95,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    from sync_ledger import file_lock
+    try:
+        with file_lock(os.path.join(HERE, "study-run.lock")):
+            sys.exit(main())
+    except RuntimeError:
+        print("STUDY_SYNC_ALREADY_RUNNING")

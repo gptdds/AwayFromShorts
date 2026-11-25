@@ -18,13 +18,24 @@
 #
 # 用法: powershell -NoProfile -ExecutionPolicy Bypass -File hub_config.ps1 [-PushOnly]
 
-param([switch]$PushOnly)
+param([switch]$PushOnly, [switch]$LibraryOnly)
 
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $log  = Join-Path $here 'hub-config.log'
 $statePath = Join-Path $here 'hub-state.json'
 $cachePhoneAct = Join-Path $here 'phone-activity.cache.json'
+
+# This script also runs as an independent hidden process. Read the version
+# cheaply and load the shared contract without assuming webui.ps1 is the caller.
+$corePath = Join-Path $here 'core.ps1'
+if (Test-Path -LiteralPath $corePath) {
+    $versionMatch = [regex]::Match(
+        [System.IO.File]::ReadAllText($corePath, [System.Text.Encoding]::UTF8),
+        "\`$script:AFS_VERSION\s*=\s*'([^']+)'")
+    if ($versionMatch.Success) { $script:AFS_VERSION = $versionMatch.Groups[1].Value }
+}
+. (Join-Path $here 'cross-contract.ps1')
 
 function Write-Log {
     param([string]$Level, [string]$Msg)
@@ -42,18 +53,26 @@ function Read-State {
     try {
         if (Test-Path $statePath) {
             $o = ConvertFrom-Json ([System.IO.File]::ReadAllText($statePath, [System.Text.Encoding]::UTF8))
-            return @{ lastHash = [string]$o.lastHash; lastPush = [string]$o.lastPush }
+            return @{
+                lastHash = [string]$o.lastHash
+                lastPush = [string]$o.lastPush
+                lastContractHash = [string]$o.lastContractHash
+            }
         }
     } catch { }
-    return @{ lastHash = ''; lastPush = '' }
+    return @{ lastHash = ''; lastPush = ''; lastContractHash = '' }
 }
 
 function Write-State {
-    param([string]$lastHash, [string]$lastPush)
+    param([string]$lastHash, [string]$lastPush, [string]$lastContractHash = '')
     try {
         $utf8 = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($statePath,
-            (ConvertTo-Json @{ lastHash = $lastHash; lastPush = $lastPush } -Compress), $utf8)
+            (ConvertTo-Json @{
+                lastHash = $lastHash
+                lastPush = $lastPush
+                lastContractHash = $lastContractHash
+            } -Compress), $utf8)
     } catch { }
 }
 
@@ -67,6 +86,52 @@ function Get-CfgHash {
         ([System.BitConverter]::ToString($m.ComputeHash($bytes))).Replace('-', '').ToLower()
     } finally { $m.Dispose() }
 }
+
+function Get-AfsHubSectionProperty {
+    param($Hub, [string]$Name)
+    if ($null -eq $Hub) { return $null }
+    $p = $Hub.PSObject.Properties[$Name]
+    if ($p) { return $p.Value }
+    return $null
+}
+
+function Get-AfsHubContractHash {
+    param($Hub, [string]$SectionName)
+    $section = Get-AfsHubSectionProperty -Hub $Hub -Name $SectionName
+    if ($null -eq $section -or $null -eq $section.contract) { return '' }
+    return [string]$section.contract.contractHash
+}
+
+# Replace only this device's known envelope fields. Unknown fields in the hub
+# and section are copied first, so an older device cannot delete metadata added
+# by a newer peer during a read-modify-write.
+function Merge-AfsHubDeviceSection {
+    param(
+        $Hub,
+        [ValidateSet('pc','phone')][string]$SectionName,
+        $Config,
+        $Contract,
+        [string]$ConfigHash
+    )
+    if ($null -eq $Hub) { $Hub = [pscustomobject]@{} }
+    $section = [ordered]@{}
+    $current = Get-AfsHubSectionProperty -Hub $Hub -Name $SectionName
+    if ($null -ne $current) {
+        foreach ($p in @($current.PSObject.Properties)) {
+            $section[[string]$p.Name] = $p.Value
+        }
+    }
+    $section.updated = Get-Date -Format 'yyyy-MM-dd HH:mm'
+    $section.writtenBy = $SectionName
+    $section.hash = $ConfigHash
+    if ($null -ne $Config) { $section.config = $Config }
+    if ($null -ne $Contract) { $section.contract = $Contract }
+    $Hub | Add-Member -NotePropertyName $SectionName `
+        -NotePropertyValue ([pscustomobject]$section) -Force
+    return $Hub
+}
+
+if ($LibraryOnly) { return }
 
 try {
     $cfgPath = Join-Path $here 'config.json'
@@ -124,14 +189,18 @@ try {
 
     $localCfg = ConvertFrom-Json ([System.IO.File]::ReadAllText($cfgPath, [System.Text.Encoding]::UTF8))
     $localHash = Get-CfgHash $localCfg
+    $localContract = Get-AfsCrossContractInfo -Platform pc
+    $localContractHash = [string]$localContract.contractHash
     $st = Read-State
 
     $hubPcHash = ''
     if ($hub.pc -and $hub.pc.hash) { $hubPcHash = [string]$hub.pc.hash }
+    $hubPcContractHash = Get-AfsHubContractHash -Hub $hub -SectionName pc
+    $contractOutdated = $hubPcContractHash -ne $localContractHash
 
     $action = 'none'
     if ($hubPcHash -eq $localHash) {
-        if ($st.lastHash -ne $localHash) { Write-State -lastHash $localHash -lastPush $st.lastPush }
+        $action = 'none'
     } elseif ($hubPcHash -eq $st.lastHash) {
         $action = 'push'      # 只有本地变了
     } elseif ($localHash -eq $st.lastHash) {
@@ -146,19 +215,28 @@ try {
         $localCfg = ConvertFrom-Json ([System.IO.File]::ReadAllText($cfgPath, [System.Text.Encoding]::UTF8))
         $localHash = Get-CfgHash $localCfg
         Write-Log 'ok' ('PULL_APPLIED rev=' + $hub.rev + ' hash=' + $localHash.Substring(0, 12))
-        Write-State -lastHash $localHash -lastPush $st.lastPush
+        Write-State -lastHash $localHash -lastPush $st.lastPush -lastContractHash $st.lastContractHash
         Write-Output ('HUB_CONFIG_PULL_APPLIED rev=' + $hub.rev)
+        if (-not $contractOutdated) { exit 0 }
+        # A pull is config-only. If this version also needs to publish a newer
+        # capability declaration, continue with a section-only contract update.
+        $action = 'none'
+    }
+
+    if ($action -eq 'none' -and -not $contractOutdated) {
+        if ($st.lastHash -ne $localHash -or $st.lastContractHash -ne $localContractHash) {
+            Write-State -lastHash $localHash -lastPush $st.lastPush `
+                -lastContractHash $localContractHash
+        }
+        Write-Output 'HUB_CONFIG_SYNC_NONE'
         exit 0
     }
 
-    if ($action -eq 'push') {
-        # 读-改-写：只换 pc 分节，phone 分节原样保留
-        $hub.pc = [pscustomobject]@{
-            updated   = Get-Date -Format 'yyyy-MM-dd HH:mm'
-            writtenBy = 'pc'
-            hash      = $localHash
-            config    = $localCfg
-        }
+    # 读-改-写：只换 pc 分节的已知字段，phone 分节和未知字段原样保留。
+    $configForPush = if ($action -eq 'push') { $localCfg } else { $null }
+    $hub = Merge-AfsHubDeviceSection -Hub $hub -SectionName pc `
+        -Config $configForPush -Contract $localContract -ConfigHash $localHash
+    if ($action -eq 'push' -or $contractOutdated) {
         $hub.rev = [int]$hub.rev + 1
         $hub.updated = Get-Date -Format 'yyyy-MM-dd HH:mm'
         $json = $hub | ConvertTo-Json -Compress -Depth 12
@@ -166,8 +244,10 @@ try {
         $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
         Invoke-RestMethod -Method Patch -Uri ('https://api.github.com/gists/' + $sync.gistId) `
             -Headers $headers -Body $bodyBytes -ContentType 'application/json; charset=utf-8' -TimeoutSec 25 | Out-Null
-        Write-Log 'ok' ('PUSH_OK rev=' + $hub.rev + ' hash=' + $localHash.Substring(0, 12))
-        Write-State -lastHash $localHash -lastPush (Get-Date -Format 'yyyy-MM-dd HH:mm')
+        Write-Log 'ok' ('PUSH_OK rev=' + $hub.rev + ' hash=' + $localHash.Substring(0, 12) +
+            ' contract=' + $localContractHash.Substring(0, 12))
+        Write-State -lastHash $localHash -lastPush (Get-Date -Format 'yyyy-MM-dd HH:mm') `
+            -lastContractHash $localContractHash
         Write-Output ('HUB_CONFIG_PUSH_OK rev=' + $hub.rev)
         exit 0
     }

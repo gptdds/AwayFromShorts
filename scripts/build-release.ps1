@@ -28,10 +28,15 @@ $runtimeFiles = @(
     'browser-state.json', 'browser-close.json', 'browser-close.log',
     'stats.json', 'activity.json',
     'study-db.json', 'focus-local.json', 'study.flag',
+    'ledger-sync-state.json', 'ledger-sync-status.json', 'study-db.json.before-sync.json',
+    'study-db.json.lock', 'study-db.json.sync.lock',
+    'study-run.lock',
     'browser-restart.json', 'browser-restart.pending.json', 'browser-close.heartbeat',
     'hub-state.json', 'study-gist-state.json', 'checkin-queue.local.json',
     'phone-activity.cache.json', 'study-gist.log', 'study-sync.log', 'hub-config.log',
-    '.webui-restart.timestamp'
+    '.webui-restart.timestamp', 'game-quota-config.json', 'game-quota-state.json', 'game-quota-state.json.tmp',
+    'quota-lan-config.json', 'quota-lan-state.json', 'quota-lan.log',
+    'quota-edit-until.json', 'quota-edit-until.json.tmp'
 )
 Get-ChildItem (Join-Path $stage 'src') -File |
     Where-Object { $runtimeFiles -contains $_.Name } |

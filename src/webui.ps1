@@ -27,6 +27,7 @@ if (-not $isAdmin) {
 }
 
 . "$PSScriptRoot\core.ps1"
+. "$PSScriptRoot\cross-contract.ps1"
 . "$PSScriptRoot\quota-rules.ps1"
 . "$PSScriptRoot\quota-ledger.ps1"
 
@@ -154,15 +155,17 @@ function Get-AfsQuotaLanView {
     $cfg = Get-AfsQuotaLanConfig $PSScriptRoot
     $now = Get-Date
     $qcPath = Join-Path $PSScriptRoot 'game-quota-config.json'
-    $sharedId = ''
+    $sharedIds = @()
     try {
         if (Test-Path -LiteralPath $qcPath) {
             $qc = ConvertTo-AfsAppQuotaConfig (Read-AfsJson $qcPath)
             foreach ($r in $qc.rules) {
-                if ($r.ContainsKey('shared') -and [bool]$r.shared) { $sharedId = [string]$r.id }
+                if ($r.ContainsKey('shared') -and [bool]$r.shared) { $sharedIds += [string]$r.id }
             }
         }
     } catch { }
+    $sharedId = ''
+    if ($sharedIds.Count -gt 0) { $sharedId = [string]$sharedIds[0] }
     @{
         ok         = $true
         config     = @{
@@ -174,14 +177,17 @@ function Get-AfsQuotaLanView {
         view       = (Get-AfsQuotaPoolView -DataDir $PSScriptRoot -Now $now)
         addresses  = @(Get-AfsLanAddresses)
         listening  = (Test-AfsLanListening -Port ([int]$cfg.port))
-        sharedRule = $sharedId
+        sharedRule  = $sharedId
+        sharedRules = @($sharedIds)
         editWindow = (Get-AfsQuotaEditWindow)
     }
 }
 
 function Get-AfsStatusObj {
     $cfg = Get-AfsConfig
-    $state = Get-AfsActiveState -Config $cfg
+    $now = Get-Date
+    $state = Get-AfsActiveState -Config $cfg -Now $now
+    $freezeActive = Test-AfsProcessFreezeActive -Config $cfg -State $state
     $lastRun = $null
     $lastPath = Join-Path (Split-Path (Get-AfsConfigPath)) 'last-run.json'
     if (Test-Path $lastPath) {
@@ -193,16 +199,23 @@ function Get-AfsStatusObj {
     @{
         ok          = $true
         version     = $script:AFS_VERSION
+        contract    = Get-AfsCrossContractInfo -Platform pc
         isAdmin     = Get-AfsIsAdmin
         active      = $state.active
         activeReason = $state.reason
+        activeWindowIndex = $state.windowIndex
+        activeWindowStart = $state.windowStart
+        activeWindowEnd = $state.windowEnd
+        freezeActive = $freezeActive
+        freezeEnabled = [bool]$cfg.freeze.enabled
         enabled     = $cfg.enabled
         hosts       = Get-AfsHostsState -Path (Get-AfsDefaultHostsPath)
         task        = Get-AfsTaskInfo
         nextActive  = Get-AfsNextActiveTime -Config $cfg
         lastRun     = $lastRun
         config      = $cfg
-        forceActive = ((Test-AfsForceActive -Config $cfg).active)
+        forceActive = ($state.reason -eq 'force')
+        forceAdjustment = (Get-AfsForceAdjustmentWindow -Now $now)
         pending     = (Read-AfsPendingQueue)
         # 强制模式期间禁止卸载: 面板据此禁用按钮(仅提示用, 真拦在 /api/uninstall 与 uninstall.ps1)
         uninstallBlocked = $ub.blocked
@@ -338,14 +351,14 @@ $handler = {
                 # 电脑单边可用的时间，所以和「调小额度」同级，只在编辑时段开放。
                 if (-not $editWindow.allowed) {
                     if ($cur.enabled -and -not $next.enabled) {
-                        throw ('停用跨设备共享会让手机那边的用量不再计入，只在每天 21:00–21:59 开放。下次 ' +
+                        throw ('停用跨设备共享会让手机那边的用量不再计入，只在' + $editWindow.label + '开放。下次 ' +
                             ([datetime]$editWindow.next).ToString('MM-dd HH:mm'))
                     }
                     if ($next.enabled -and $cur.token -and $next.token -ne $cur.token) {
-                        throw '换令牌等于断开手机，只在每天 21:00–21:59 开放'
+                        throw ('换令牌等于断开手机，只在' + $editWindow.label + '开放')
                     }
                     if ($next.enabled -and $cur.enabled -and $next.port -ne $cur.port) {
-                        throw '换端口等于断开手机，只在每天 21:00–21:59 开放'
+                        throw ('换端口等于断开手机，只在' + $editWindow.label + '开放')
                     }
                 }
                 if ($next.enabled -and -not $next.token) { $next.token = New-AfsQuotaLanToken }
@@ -372,25 +385,39 @@ $handler = {
             $qc = ConvertTo-AfsAppQuotaConfig $qc
             $qs = $null
             if (Test-Path $qsPath) { $qs = Read-AfsAppQuotaState $qsPath (Get-Date) }
+            $now = Get-Date
+            $masterEnabled = $true
+            try { $masterEnabled = [bool](Get-AfsConfig).enabled } catch { }
+            $editWindow = Get-AfsQuotaEditWindow -MasterEnabled $masterEnabled -QuotaEnabled ([bool]$qc.enabled)
             $healthy = $false
             if ($qs -and $qs.updatedAt) {
-                $age = ((Get-Date) - [datetime]$qs.updatedAt).TotalSeconds
+                $age = ($now - [datetime]$qs.updatedAt).TotalSeconds
                 $healthy = ($age -ge 0 -and $age -lt 10)
             }
             if ($qs) {
                 $lastUpdate = $qs.updatedAt
-                $qs = Update-AfsAppQuotaState $qs $qc (Get-Date)
+                $sharedUsage = Get-AfsQuotaSharedUsage $PSScriptRoot $now $qc.rules
+                $qs = Update-AfsAppQuotaState $qs $qc $now -SharedPools $sharedUsage
                 $qs.updatedAt = $lastUpdate
+                foreach ($rule in $qc.rules) {
+                    $app = $qs.apps[$rule.id]
+                    $app.counting = $healthy -and $masterEnabled -and $qc.enabled -and $app.activeToday -and -not $app.exhausted -and
+                        [bool](@(Get-AfsQuotaTargetIds $rule) | Where-Object { $_ -in $qs.foregroundIds })
+                }
             }
-            Send-AfsJson -Stream $stream -Status 200 -Obj @{ok=$true; config=$qc; state=$qs; healthy=$healthy; editWindow=(Get-AfsQuotaEditWindow)}
+        Send-AfsJson -Stream $stream -Status 200 -Obj @{ok=$true; config=$qc; state=$qs; healthy=$healthy; masterEnabled=$masterEnabled; editWindow=$editWindow}
             return
         }
         if ($method -eq 'POST' -and $path -eq '/api/game-quota') {
             try {
-                $editWindow = Get-AfsQuotaEditWindow
                 $incoming = ConvertTo-AfsHashtable (ConvertFrom-Json $body -ErrorAction Stop)
                 $qc = ConvertTo-AfsAppQuotaConfig $incoming
                 $qcPath = Join-Path $PSScriptRoot 'game-quota-config.json'
+                $curQc = $null
+                if (Test-Path $qcPath) { $curQc = ConvertTo-AfsAppQuotaConfig (Read-AfsJson $qcPath) }
+                $masterEnabled = $true
+                try { $masterEnabled = [bool](Get-AfsConfig).enabled } catch { }
+                $editWindow = Get-AfsQuotaEditWindow -MasterEnabled $masterEnabled -QuotaEnabled ([bool]$curQc.enabled)
                 # 跨设备共享标记（2026-11-02 起面板上有勾选了）：
                 #   · 前端显式带了 shared 字段 → 以它为准，用户想关就关；
                 #   · 前端一个字没提（旧缓存页面 / 旧版客户端）→ 按 id 从原配置继承。
@@ -411,10 +438,8 @@ $handler = {
                     } catch { }
                 }
                 if (-not $editWindow.allowed) {
-                    # 规定时间以外: 应用和进程「只进不出」—— 只能加, 不能删/降时长/关开关
-                    $curQc = $null
-                    if (Test-Path $qcPath) { $curQc = ConvertTo-AfsAppQuotaConfig (Read-AfsJson $qcPath) }
-                    $blockedByAppendOnly = Test-AfsQuotaAppendOnly -Current $curQc -Incoming $qc
+                    # 规定时间以外: 应用和进程「只进不出」—— 只能加, 不能删/降时长
+                    $blockedByAppendOnly = Test-AfsQuotaAppendOnly -Current $curQc -Incoming $qc -WindowLabel $editWindow.label
                     if ($blockedByAppendOnly) { throw $blockedByAppendOnly }
                 }
                 Write-AfsJson $qcPath $qc
@@ -439,11 +464,11 @@ $handler = {
             Send-AfsJson -Stream $stream -Status 200 -Obj (Get-AfsStatusObj)
             return
         }
-        if ($method -eq 'GET' -and $path -eq '/api/browser/windows') {
-            $w = @(Get-Process msedge,chrome -ErrorAction SilentlyContinue |
-                Where-Object { $_.MainWindowTitle } |
-                ForEach-Object { [string]$_.MainWindowTitle } | Select-Object -Unique)
-            Send-AfsJson -Stream $stream -Status 200 -Obj @{ ok = $true; windows = $w }
+        if ($method -eq 'GET' -and $path -eq '/api/contract') {
+            Send-AfsJson -Stream $stream -Status 200 -Obj @{
+                ok = $true
+                contract = Get-AfsCrossContractInfo -Platform pc
+            }
             return
         }
         if ($method -eq 'POST' -and $path -eq '/api/config') {
@@ -457,12 +482,11 @@ $handler = {
                 if ($forceNow.active -and -not [bool]$inCfg.enabled) {
                     throw "强制模式生效中 (可先关闭强制模式, 再关闭屏蔽)"
                 }
-                # 屏蔽时段的锁只在"强制模式开启"时生效 (防破戒);
-                # 强制模式关闭 / 非屏蔽时段: 黑名单和白名单都可以自由增删, 不做任何拦截。
+                # 强制模式开启期间一律禁止放宽 (防破戒); 只有关闭强制模式后才能自由增删。
                 if ([bool]$curCfg.force.enabled) {
                     $diff = Get-AfsConfigLockDiff -Current $curCfg -Incoming $inCfg
                     if ($diff.hardMsg) { throw $diff.hardMsg }
-                    if ($forceNow.active -and $diff.widenMsg) { throw $diff.widenMsg }
+                    if ($diff.widenMsg) { throw $diff.widenMsg }
                     if (@($diff.queueKeys).Count -gt 0 -and $forceNow.active) {
                         # 老版本排下的队列先一并落地, 再叠本次改动 (都只收紧, 无放行风险)
                         try {
@@ -518,7 +542,13 @@ $handler = {
                 $o = $body | ConvertFrom-Json -ErrorAction Stop
                 $enable = [bool]$o.enabled
                 $c = Get-AfsConfig
+                $adjustment = Get-AfsForceAdjustmentWindow
+                $adjustmentHours = "$($adjustment.start)–$($adjustment.end)"
                 if ($enable) {
+                    if ($c.force.enabled) {
+                        Send-AfsJson -Stream $stream -Status 409 -Obj @{ ok = $false; error = "强制模式已开启。如需更改强制星期，请在 $adjustmentHours 先关闭强制模式。" }
+                        return
+                    }
                     # 可选"强制星期" (1=周一..7=周日, 空=跟随屏蔽计划星期)
                     $c.force.weekdays = $null
                     if ($o.PSObject.Properties.Name -contains 'weekdays' -and $o.weekdays) {
@@ -528,27 +558,24 @@ $handler = {
                     # 长期模式(星期循环, 无到期日): 所选星期的屏蔽窗口内持续强制, 直到手动关闭
                     $c.force.enabled = $true
                     $c.force.until  = $null
-                    Set-AfsConfigSafe -InputConfig $c | Out-Null
+                    Set-AfsConfigSafe -InputConfig $c -AllowForceChange | Out-Null
                     Save-AfsForceState -Until $null
                     Send-AfsJson -Stream $stream -Status 200 -Obj @{
                         ok = $true
                         until = $null
-                        note = '强制模式已开启: 所选星期的屏蔽时段内长期强制(无到期日); 强制中无法关闭, 窗口外 / 非所选星期可手动关闭'
+                        note = "强制模式已开启。关闭时间为每天 $adjustmentHours。"
                     }
                 } else {
-                    # 开启后当天内不可关闭(防破戒): 生效中(屏蔽窗口内且未到期)一律拒绝
-                    $ft = Test-AfsForceActive -Config $c
-                    if ($ft.active) {
-                        Send-AfsJson -Stream $stream -Status 403 -Obj @{ ok = $false; error = '强制模式正在生效中, 无法关闭(防破戒): 等当前屏蔽时段结束, 或在非所选星期 / 屏蔽窗口外再关闭。' }
+                    if (-not $adjustment.allowed) {
+                        Send-AfsJson -Stream $stream -Status 403 -Obj @{ ok = $false; error = "只能在每天 $adjustmentHours 的调整时段关闭强制模式。" }
                         return
                     }
-                    # 未生效(已到期 / 窗口外残留): 允许清理
                     $c.force.enabled = $false
                     $c.force.until  = $null
                     $c.force.weekdays = $null
-                    Set-AfsConfigSafe -InputConfig $c | Out-Null
+                    Set-AfsConfigSafe -InputConfig $c -AllowForceChange | Out-Null
                     Remove-AfsForceState
-                    Send-AfsJson -Stream $stream -Status 200 -Obj @{ ok = $true; note = '强制模式已关闭(未生效状态已清理)' }
+                    Send-AfsJson -Stream $stream -Status 200 -Obj @{ ok = $true; note = '强制模式已关闭。' }
                 }
             } catch {
                 Send-AfsJson -Stream $stream -Status 400 -Obj @{ ok = $false; error = $_.Exception.Message }
@@ -653,20 +680,25 @@ $handler = {
                 $b = $body | ConvertFrom-Json -ErrorAction Stop
                 # 只有开关, 没有时间窗(老的 start/end 字段来了也直接忽略)
                 $c = Get-AfsConfig
-                # 防绕过: PC 正在屏蔽中就不许关学习联动 —— 目标没打完时打开面板
-                # 把开关一关, 延长屏蔽立刻失效。
-                # force 长期开着的话这一条等于把开关焊死, 关它得先过 force 这关。
-                if (-not [bool]$b.enabled) {
-                    $stH = Get-AfsActiveState -Config $c
-                    if ($stH.active) {
-                        throw ("PC 正在屏蔽时间内（" + $stH.reason + "），学习联动开关不能关闭")
-                    }
-                }
                 $c.studyHold = @{ enabled = [bool]$b.enabled }
                 Set-AfsConfigSafe -InputConfig $c | Out-Null
+                # 开关是用户明确操作, 关闭后立即重算, 不让 study-hold 再多锁一拍。
+                $applied = $false
+                if (Get-AfsIsAdmin) {
+                    try {
+                        Invoke-AfsLocked -Action {
+                            Invoke-AfsEnforce -Config (Get-AfsConfig) -HostsPath (Get-AfsDefaultHostsPath) -LogPath $logPath
+                        } | Out-Null
+                        $applied = $true
+                    } catch { $applied = $false }
+                }
+                $cfgH = Get-AfsConfig
+                $stH = Get-AfsActiveState -Config $cfgH
+                $noteH = if ($applied) { '学习联动已保存并立即生效' } else { '学习联动已保存, 1 分钟内生效' }
                 Send-AfsJson -Stream $stream -Status 200 -Obj @{
-                    ok = $true; studyHold = (Get-AfsConfig).studyHold
-                    note = '已保存, 1 分钟内生效'
+                    ok = $true; studyHold = $cfgH.studyHold
+                    applied = $applied; active = $stH.active; reason = $stH.reason
+                    note = $noteH
                 }
             } catch {
                 Send-AfsJson -Stream $stream -Status 400 -Obj @{ ok = $false; error = $_.Exception.Message }

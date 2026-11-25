@@ -22,6 +22,12 @@ reset-apps.txt
 
 # 学习台/同步的运行时数据(本机状态, 不进仓库)
 study-db.json
+study-db.json.*
+ledger-sync-*.json
+*.sync.lock
+*.json.lock
+study-run.lock
+__pycache__/
 focus-local.json
 study.flag
 sync-state.json
@@ -33,3 +39,6 @@ phone-activity.cache.json
 browser-*.json
 browser-*.heartbeat
 *.bak-*
+game-quota-config.json
+game-quota-state.json*
+quota-edit-until.json*

@@ -33,7 +33,7 @@ try {
             force = @{ enabled = $false; until = $null; weekdays = @() }
             web = @{ port = 8737 }
             studyHold = @{ enabled = $holdEnabled }
-            browser = @{ enabled = $true; windows = @(); urlBlock = $false; targets = @('edge','chrome') }
+            browser = @{ urlBlock = $false; targets = @('edge','chrome') }
         }
         $json = $cfg | ConvertTo-Json -Depth 8
         [System.IO.File]::WriteAllText($cfgPath, $json, (New-Object System.Text.UTF8Encoding($false)))

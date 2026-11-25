@@ -75,7 +75,7 @@ const markers = [
   ["卸载守卫: 状态驱动禁用按钮", /btn\.disabled = blocked;/],
   ["卸载守卫: 点击二次守卫", /if \(status && status\.uninstallBlocked\)/],
   ["卸载守卫: 手动卸载说明随锁定改文案", /id="uninstallManualNote"/],
-  ["卸载守卫: 随状态/轮询刷新", /renderTop\(\); renderHome\(\); renderStatus\(\); renderUninstallGuard\(\);/],
+  ["卸载守卫: 随状态/轮询刷新", /renderTop\(\); renderHome\(\); renderStatus\(\); renderFreeze\(\); renderUninstallGuard\(\);/],
   ["全局滚动: 外壳不再锁死高度", /\.app \{ display: flex; min-height: 100vh; \}/],
   ["全局滚动: 侧边栏 sticky", /position: sticky; top: 0; height: 100vh/],
   ["自动刷新周期 20s", /const AUTO_REFRESH_MS = 20000;/],
@@ -130,27 +130,24 @@ const markers = [
   ["强制模式: 禁用+整行变灰 helper", /function setLocked\(/],
   ["强制模式: 硬锁行整行变灰", /row\.classList\.toggle\("locked", !!locked\)/],
   ["强制模式: 屏蔽网页提示位", /id="sitesLockNote"/],
-  ["强制模式: 屏蔽进程提示位", /id="procLockNote"/],
+  ["强制模式: 时段名单提示位", /id="freezeWindowLockNote"/],
   ["强制模式: 白名单提示位", /id="wlLockNote"/],
   ["强制模式: 同步拉取硬锁提示位", /id="syncLockNote"/],
   ["强制模式: 渲染时调用提示", /applyLockNote\("#sitesLockNote", locked,/],
   ["强制模式: 云端拉取硬锁 toast", /「从云端拉取配置」不可用/],
-  // 生效时段内「只能增不能删」: 收紧方向可排队, 放宽方向直接拒绝
-  ["收紧: tightenOnly 开关", /const tightenOnly = \(\) => forceLocked\(\) && forceActiveNow;/],
+  // 强制模式开启期间「只能增不能删」: 收紧方向可保存, 放宽方向直接拒绝
+  ["收紧: tightenOnly 开关", /const tightenOnly = \(\) => forceLocked\(\);/],
   ["收紧: 放宽提示 helper", /function tightenToast\(what, why\)/],
-  ["收紧: 屏蔽名单种类表", /const SHIELD_KIND = \{ site:/],
-  ["收紧: 删除按钮按 tightenOnly 禁用", /renderList\("#siteList", cfg\.blockedSites, "site", ro, "强制模式生效中: 只能新增域名, 不能删除"\)/],
-  ["收紧: 工作区删除按钮禁用", /renderList\("#browserWinList", cfg\.browser\.windows, "bwin", ro,/],
-  ["收紧: 进程删除按钮禁用", /renderList\("#procList", cfg\.blockedProcesses, "proc", ro,/],
-  ["收紧: 删除事件二次守卫", /if \(SHIELD_KIND\[kind\] && tightenOnly\(\)\)/],
-  ["收紧: 网站预设取消勾选拦截", /tightenToast\("「屏蔽网页」域名", "取消勾选等于删掉这些域名"\)/],
-  ["收紧: 进程预设取消勾选拦截", /tightenToast\("「屏蔽进程」", "取消勾选等于删掉这些进程"\)/],
+  ["收紧: 时段名单字段表", /const WINDOW_LIST_FIELDS = \{/],
+  ["收紧: 删除按钮按 locked 禁用", /data-window-del="\$\{field\}"[\s\S]{0,140}\$\{locked \? 'disabled title="强制模式开启中，删除时段名单等于放宽，已锁定"/],
+  ["收紧: 删除事件二次守卫", /if \(forceLocked\(\)\) \{[\s\S]{0,140}tightenToast\("「时段专属名单」", "删掉一条就等于放行一点"\)/],
+  ["收紧: 时段预设取消勾选拦截", /if \(forceLocked\(\)\) \{[\s\S]{0,140}tightenToast\("「当前时段名单」", "取消已选预设等于删掉这些条目"\)/],
   ["收紧: 白名单新增拦截", /tightenToast\(kind === "wlsite" \? "「白名单域名」" : "「白名单进程」", "加入白名单等于变相放行"\)/],
   ["收紧: 白名单输入框禁用", /setLocked\("#addWlSiteBtn", ro\)/],
   ["收紧: 总开关开关不能关", /if \(tightenOnly\(\) && !e\.target\.checked\)/],
   ["收紧: 工作区/网址拦截开关不能关", /tightenToast\("「网址拦截」开关"/],
   ["收紧: 卡片琥珀色受限边框", /\.preset\.tighten \{ border-color: rgba\(255,176,32,\.3\); \}/],
-  ["收紧: 提示条按方向措辞", /const rule = shrink \? "只能减少, 不能新增" : "只能新增, 不能删减";/],
+  ["收紧: 提示条按方向措辞", /const rule = "只能新增, 不能删减";/],
   ["收紧: 强制卡片同步说明", /只能收紧不能放宽/],
   // 首屏健壮性 (开机后空白页回归防护)
   ["首屏分接口结算 allSettled", /Promise\.allSettled\(/],
@@ -158,7 +155,7 @@ const markers = [
   ["启动即触发重试", /bootRetry\(\);/],
   ["自动刷新兜底加载", /if \(!status \|\| !cfg\) \{ await load\(\); return; \}/],
   ["状态胶囊可点击重连", /topPillEl\.addEventListener\("click"/],
-  ["渲染前校验核心数据", /if \(cfg && status\) \{ renderHome\(\); renderStatus\(\); \}/],
+  ["渲染前校验核心数据", /if \(cfg && status\) \{ renderHome\(\); renderStatus\(\); renderFreeze\(\); \}/],
   ["连接中提示", /正在连接面板/],
   // 视觉分层: bilibili 靠三档线 + 三级底色, 噪波/光斑属反 AI 味花活已整体移除
   ["分层: 三档线走令牌", /border: 1px solid var\(--border\);/],
@@ -190,11 +187,34 @@ const markers = [
   ["检查: 无胶囊圆角 9999px", /9999px/, true],
   ["检查: 无 Linear 色残留", /#5e6ad2|#08090a|#8a8f98|#0f1011/, true],
   // 站点项路径支持: "域名" 或 "域名/路径" (整站屏蔽 + 路径放行)
-  ["路径: 屏蔽输入框提示含路径示例", /placeholder="例如: example\.com 或 www\.bilibili\.com\/video\/\*"/],
+  ["路径: 屏蔽输入框提示含路径示例", /placeholder: "例如: example\.com 或 www\.bilibili\.com\/video\/\*"/],
   ["路径: 白名单输入框提示含路径示例", /placeholder="例如: mail\.example\.com 或 www\.bilibili\.com\/video\/\*"/],
   ["路径: 白名单说明区分整站与路径", /只放行该路径, 同域名的其他页面仍按屏蔽表处置/],
   ["路径: 添加时保留尾缀通配", /if \(v\.endsWith\("\/\*"\)\)/],
   ["路径: 校验提示含路径写法", /需为域名，或「域名\/路径」/],
+  ["信息架构: 时间限额一级入口", /data-tab="quota"[^>]*>[\s\S]{0,80}时间限额/],
+  ["信息架构: 时间限额独立面板", /id="panel-quota"/],
+  ["信息架构: 网站与冻结应用并入冻结时段", /class="window-scope-grid"/],
+  ["信息架构: 时段名单计数取并集", /function windowUnionCount\(field\)/],
+  ["排列: 按列 / 堆积切换", /id="freezeLayoutToggle"/],
+  ["排列: 窗口按列布局", /#windowRows\.layout-columns/],
+  ["排列: 名单堆积布局", /#windowRows\.layout-stack \.window-scope-grid/],
+  ["排列: 布局偏好持久化", /FREEZE_LAYOUT_KEY/],
+  ["信息架构: 网站屏蔽独立页已移除", /id="panel-sites"/, true],
+  ["信息架构: 冻结应用独立页已移除", /id="panel-processes"/, true],
+  ["限额星期: 七个星期选项", /const QUOTA_WEEKDAYS = \["一","二","三","四","五","六","日"\];/],
+  ["限额星期: 旧数据默认七天", /return days\.length \? \[\.\.\.new Set\(days\)\]\.sort/],
+  ["限额星期: 至少保留一天", /每条限额规则至少保留一个生效星期/],
+  ["限额星期: 今日未启用不累计", /今天未启用，不累计、不冻结/],
+  ["限额星期: 自定义应用与共享格复用", /id="quotaProcessName"[\s\S]{0,260}id="quotaAddApp"/],
+  ["限额开关: 规定时间外也可关闭", /时间限额开关可随时关闭/],
+  ["限额开关: 不再按修改时段禁用", /quotaToggle\.disabled = overviewToggle\.disabled = false;/],
+  ["限额编辑: 总开关或限额关闭时解锁", /editUnlocked\s*\?[\s\S]{0,160}可以自由调整应用/],
+  ["限额编辑: 复用统一调整时段", /quotaWindowLabel = editWindow\?\.label \|\| '调整时段'/],
+  ["限额编辑: 不再写死 21 点", /每天 21:00–21:59/, true],
+  ["限额保存: 顶部保存合并未提交限额", /hadQuotaChanges\s*&&[\s\S]{0,120}saveQuotaSettings\(\{ quiet: true \}\)/],
+  ["学习联动: 开关可随时关闭", /学习联动是独立开关[\s\S]{0,120}sw\.disabled = false;/],
+  ["学习联动: 关闭后立即解除提示", /当前由学习联动延长屏蔽，关闭后会立即解除/],
 ];
 /* 第 3 个元素为 true 时表示「反向断言」: 该 pattern 必须不出现(用于守 Linear 风格不被回退) */
 markers.forEach(([name, re, mustAbsent]) => {
@@ -210,11 +230,22 @@ try {
   const core = fs.readFileSync(coreFile, "utf8");
   const ui = fs.readFileSync(uiFile, "utf8");
   const engine = fs.readFileSync(engineFile, "utf8");
+  const quota = fs.readFileSync(path.join(__dirname, "..", "src", "quota-rules.ps1"), "utf8");
+  const game = fs.readFileSync(path.join(__dirname, "..", "src", "game-quota.ps1"), "utf8");
+  const quotaTask = fs.readFileSync(path.join(__dirname, "..", "src", "register-game-quota-task.ps1"), "utf8");
+  const webTask = fs.readFileSync(path.join(__dirname, "..", "src", "register-webui-task.ps1"), "utf8");
   const backend = [
     ["后端: /api/account 本地缓存优先", /hasCache/, core],
     ["后端: 用户信息缓存落盘", /function Save-AfsAccountCache/, core],
     ["后端: 缓存缺失时限时补拉(6s)", /TimeoutSec 6/, core],
     ["后端: 登录成功写缓存", /Save-AfsAccountCache \$u/, ui],
+    ["后端: 限额星期归一化", /function ConvertTo-AfsQuotaDays/, quota],
+    ["后端: 限额星期生效判定", /function Test-AfsQuotaRuleActive/, quota],
+    ["后端: 额度累计只处理当天星期", /\$activeRules = @\(\$Config\.rules \| Where-Object \{ Test-AfsQuotaRuleActive \$_ \$Now \}\)/, quota],
+    ["后端: 额度用尽关闭按当天星期过滤", /Test-AfsQuotaRuleActive \$_ \$now/, game],
+    ["后端: 限额编辑复用统一调整时段", /Get-AfsAdjustmentWindow -Now \$Now/, quota],
+    ["升级: 限额任务先停旧实例", /Stop-ScheduledTask -TaskName \$taskName[\s\S]{0,180}Register-ScheduledTask/, quotaTask],
+    ["升级: WebUI 先停旧实例", /Stop-ScheduledTask -TaskName \$TaskName[\s\S]{0,260}schtasks \/Create/, webTask],
     // 运行时文件(stats/activity)由主引擎高频写入, 非原子写会让面板读到半截 JSON
     ["后端: 运行时文件原子写", /function Write-AfsTextAtomic/, core],
     ["后端: 读文件短重试", /function Read-AfsTextRetry/, core],
@@ -224,7 +255,7 @@ try {
     ["后端: activity 落盘用原子写", /Write-AfsTextAtomic -Path \(Get-AfsActivityPath\)/, core],
     // 强制模式开启期间的改动处理 (防破戒):
     //   硬拒 = 屏蔽星期 / 屏蔽时段 (它们定义了"何时算非屏蔽时段")
-    //   可排队 = 屏蔽网页 / 屏蔽进程 / 白名单 (生效时段内先入队, 非屏蔽时段由引擎自动落地)
+    //   收紧 = 屏蔽网页 / 屏蔽进程 / 白名单 (可新增, 不可删除)
     // 判据集中在 core.ps1 的 Get-AfsConfigLockDiff, 离线回归见 tools/verify-lock.ps1
     ["后端: 名单签名归一化函数", /function Get-AfsListSignature/, core],
     ["后端: 名单差异摘要", /function Get-AfsListDelta/, core],
@@ -235,29 +266,29 @@ try {
     ["后端: 兼容入口支持 -ForceActive", /\[switch\]\$ForceActive/, core],
     ["后端: 屏蔽星期=硬拒", /Get-AfsListSignature \$Current\.schedule\.days/, core],
     ["后端: 屏蔽时段=硬拒", /Get-AfsListSignature \$curWin\) -ne \(Get-AfsListSignature \$newWin/, core],
-    ["后端: 删屏蔽域名=放宽", /Get-AfsListRemoved -Old \$Current\.blockedSites -New \$Incoming\.blockedSites/, core],
-    ["后端: 加屏蔽域名=收紧(排队)", /Get-AfsListAdded   -Old \$Current\.blockedSites -New \$Incoming\.blockedSites/, core],
-    ["后端: 删屏蔽进程=放宽", /Get-AfsListRemoved -Old \$Current\.blockedProcesses -New \$Incoming\.blockedProcesses/, core],
-    ["后端: 删 Edge 工作区=放宽", /Get-AfsListRemoved -Old \(\$Current\.browser\)\.windows/, core],
+    ["后端: 时段删名单项=放宽", /\$rm = @\(Get-AfsListRemoved -Old \$cList -New \$nList\)/, core],
+    ["后端: 时段加名单项=收紧(排队)", /\$ad = @\(Get-AfsListAdded   -Old \$cList -New \$nList\)/, core],
+    ["后端: 时段名单只收紧合并", /\$add = @\(Get-AfsWindowListValue -Window \$pw -Field \$field\)/, core],
     ["后端: 关屏蔽开关=放宽", /\$curWeb\) \{/, core],
     ["后端: 加白名单=放宽", /Get-AfsListAdded   -Old \(\$Current\.whitelist\)\.sites/, core],
-    ["后端: 收窄提示 widenMsg", /\$widenMsg = '强制模式生效中, 屏蔽网页名单/, core],
+    ["后端: 收窄提示 widenMsg", /\$widenMsg = '强制模式开启期间, 每个时段的专属名单「只能新增, 不能删减」/, core],
     ["后端: 排队补丁生成", /function New-AfsPendingPatch/, core],
-    ["后端: 补丁只收新增项", /\$grouped\.sites = \[string\[\]\]@\(\$adSites \| ForEach-Object \{ "\+ \$_" \}\)/, core],
+    ["后端: 补丁只收新增项", /\$windowLines\[\$wf\.Key\]\.Add\("\+ \$\(\$nw\.start\)-/, core],
     ["后端: 队列落盘 pending-config.json", /function Save-AfsPendingQueue/, core],
     ["后端: 队列读取", /function Read-AfsPendingQueue/, core],
     ["后端: 队列清除", /function Remove-AfsPendingQueue/, core],
     ["后端: 队列落地入口", /function Invoke-AfsPendingApply/, core],
     ["后端: 落地做只收紧合并", /function Merge-AfsPendingTighten/, core],
-    ["后端: 合并=屏蔽名单取并集", /\$out\.blockedSites = @\(Normalize-AfsList \(@\(\$Base\.blockedSites\) \+ \$pSites\)/, core],
+    ["后端: 合并=时段名单取并集", /\$copy\[\$field\] = @\(Get-AfsWindowListValue -Window \$tmp -Field \$field\)/, core],
+    ["后端: 旧全局名单迁移到时段的入口", /function Convert-AfsLegacyBlockLists/, core],
     ["后端: 合并=白名单取交集", /if \(\$null -eq \$keepS\) \{ @\(\(\$Base\.whitelist\)\.sites\) \}/, core],
     ["后端: 合并=开关取或", /\$out\.blockWebsites = \[bool\]\(\[bool\]\$Base\.blockWebsites -or \[bool\]\$Patch\.blockWebsites\)/, core],
-    ["后端: 合并只认名单字段", /# 只认这几个字段, 补丁里夹带的其他键\(如 schedule\)一律不生效/, core],
+    ["后端: 合并只认名单字段", /# 只认名单\/开关字段与"给现有冻结时段追加名单项"/, core],
     ["后端: 生效时段内不落地", /reason = 'force-active'/, core],
     ["后端: 面板调用分类判据", /Get-AfsConfigLockDiff -Current \$curCfg -Incoming \$inCfg/, ui],
-    ["后端: 生效时段内拒绝放宽", /if \(\$forceNow\.active -and \$diff\.widenMsg\) \{ throw \$diff\.widenMsg \}/, ui],
-    ["后端: 生效时段内改为排队", /Save-AfsPendingQueue -Current \$curCfg -Incoming \$inCfg/, ui],
-    ["后端: 保存响应带 queued", /queued\s+= \$true/, ui],
+    ["后端: 强制模式开启期间拒绝放宽", /if \(\$diff\.widenMsg\) \{ throw \$diff\.widenMsg \}/, ui],
+    ["后端: 生效时段内收紧改动立即合并", /Merge-AfsPendingTighten -Base \$curCfg -Patch \$np\.patch/, ui],
+    ["后端: 保存响应标记已写入", /note\s+= '已保存: 收紧改动已写入配置/, ui],
     ["后端: 排队清除接口", /'\/api\/pending\/clear'/, ui],
     ["后端: config 接口带 pending", /pending\s+= \(Read-AfsPendingQueue\)/, ui],
     ["后端: status 接口带 pending", /pending\s+= \(Read-AfsPendingQueue\)/, ui],
@@ -269,19 +300,25 @@ try {
     ["卸载守卫: 保留状态文件残留防篡改", /reason = 'force-residue'/, core],
     ["后端: force 开关/星期不可经保存更改", /\[void\]\$hardKeys\.Add\('force'\)/, core],
     ["后端: force 星期对比用签名归一", /Get-AfsListSignature \$curFwd\) -ne \(Get-AfsListSignature \$newFwd/, core],
+    ["后端: 学习联动可随时关闭", /\$c\.studyHold = @\{ enabled =/, ui],
+    ["后端: 学习联动关闭后立即生效", /学习联动已保存并立即生效/, ui],
   ];
   backend.forEach(([name, re, src]) => rep(name, re.test(src)));
 } catch (e) { rep("读取后端脚本", false, "- " + e.message); }
 
-/* ---------- 3. 结构平衡 ---------- */
+/* ---------- 3. 已移除功能不得回退 ---------- */
+rep("Edge 工作区屏蔽 UI 已移除", !/browserWinList|browserWinInput|browserWindows|browserSwitch/.test(html));
+
+/* ---------- 4. 结构平衡 ---------- */
 const cnt = (re) => (html.match(re) || []).length;
 const navBtn = cnt(/<button type="button" class="nav-item[^>]*>/g);
-rep("侧边栏按钮数 = 7", navBtn === 7, "(实际 " + navBtn + ")");
+rep("侧边栏按钮数 = 8", navBtn === 8, "(实际 " + navBtn + ")");
 rep("无遗留 <aside>", cnt(/<aside\b/g) === 0);
 rep("<nav> 标签平衡", cnt(/<nav\b/g) === cnt(/<\/nav>/g));
 const panelIds = [...html.matchAll(/id="panel-([a-z]+)"/g)].map(m => m[1]);
-const tabIds = [...html.matchAll(/data-tab="([a-z]+)"/g)].map(m => m[1]);
-rep("tab 与 panel 一一对应", JSON.stringify(panelIds) === JSON.stringify(tabIds), tabIds.join(","));
+const tabIds = [...html.matchAll(/<button type="button" class="nav-item[^"]*" data-tab="([a-z]+)"/g)].map(m => m[1]);
+const sameSet = panelIds.length === tabIds.length && panelIds.every(id => tabIds.includes(id)) && tabIds.every(id => panelIds.includes(id));
+rep("tab 与 panel 一一对应", sameSet, tabIds.join(","));
 
 const css = [...html.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/g)].map(m => m[1]).join("\n");
 const ob = (css.match(/\{/g) || []).length, cb = (css.match(/\}/g) || []).length;

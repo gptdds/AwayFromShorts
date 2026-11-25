@@ -34,7 +34,15 @@ if (-not (Test-Path (Join-Path $app 'src\webui.ps1'))) {
 # 只同步程序本体文件, 不碰运行时数据(config.json / stats.json / token 等)。
 $files = @(
     'awayfromshorts.ps1',
+    'game-quota.ps1',
+    'quota-rules.ps1',
+    'quota-ledger.ps1',
+    'quota-lan.ps1',
+    'register-game-quota-task.ps1',
     'core.ps1',
+    'cross-contract.ps1',
+    'contracts\awayfromshorts-cross-platform-v1.json',
+    'contracts\awayfromshorts-cross-platform-v1.schema.json',
     'webui.ps1',
     'close-browser-windows.ps1',
     'register-task.ps1',
@@ -51,6 +59,7 @@ $files = @(
     'apply_checkins.py',
     'check_study.py',
     'study_sync.py',
+    'sync_ledger.py',
     'sync_activity.py'
 )
 
@@ -67,11 +76,19 @@ foreach ($f in $files) {
     if (Test-Path $dst) {
         Copy-Item $dst "$dst.bak-$stamp" -Force -ErrorAction SilentlyContinue
     }
+    $dstDir = Split-Path $dst -Parent
+    if (-not (Test-Path -LiteralPath $dstDir)) {
+        New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
+    }
     Copy-Item $src $dst -Force
     Write-Host "[同步] $f"
     $synced++
 }
 
+if (Test-Path (Join-Path $app 'src\game-quota-config.json')) {
+    Stop-ScheduledTask -TaskName 'AwayFromShorts-GameQuota' -ErrorAction SilentlyContinue
+    & (Join-Path $app 'src\register-game-quota-task.ps1')
+}
 # ---------------- 重启面板服务 ----------------
 Write-Host ""
 Write-Host "正在重启面板服务..."

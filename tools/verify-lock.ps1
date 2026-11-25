@@ -5,8 +5,8 @@
 #  覆盖 core.ps1 的 Get-AfsConfigLockDiff / Test-AfsConfigLockViolation 与排队落地逻辑。
 #  强制模式生效时段内, 名单类改动只允许"收紧", 不允许"放宽":
 #    hard  (拒绝) = 屏蔽星期 / 屏蔽时段 -> 它们定义了"何时算非屏蔽时段", 参与排队会让排队机制自己失效
-#    widen (拒绝) = 删屏蔽项 / 关屏蔽开关 / 往白名单加项 -> 都是直接放行
-#    queue (排队) = 加屏蔽项 / 开屏蔽开关 / 从白名单删项 -> 方向是更严, 生效时段内先入队
+#    widen (拒绝) = 删屏蔽项 / 关屏蔽开关 / 白名单增删 -> 白名单只进不出
+#    queue (排队) = 加屏蔽项 / 开屏蔽开关 / 开冻结时段 -> 方向是更严, 生效时段内先入队
 #    none  (放行) = 没改 / 只改大小写或顺序或重复项 / 只改无关字段
 #  Exit code: 0 = all pass, 1 = failures
 # ============================================================
@@ -17,11 +17,16 @@ $script:bad = 0
 
 function New-BaseCfg {
     @{
-        blockedSites     = @('douyin.com', 'youtube.com')
-        blockedProcesses = @('chrome', 'msedge')
         blockWebsites    = $true
-        schedule         = @{ days = @(1, 2, 3); windows = @(@{ start = '07:15'; end = '09:15' }) }
-        browser          = @{ enabled = $true; urlBlock = $false; windows = @('Game') }
+        schedule         = @{
+            days = @(1, 2, 3)
+            windows = @(@{
+                start = '07:15'; end = '09:15'
+                blockedSites = @('douyin.com', 'youtube.com')
+                blockedProcesses = @('chrome', 'msedge')
+            })
+        }
+        browser          = @{ urlBlock = $false }
         whitelist        = @{ sites = @(); processes = @() }
     }
 }
@@ -68,8 +73,8 @@ Write-Host '--- A. hard guard (schedule / dropped fields) ---'
 Check 'identical config' $false (New-BaseCfg) (New-BaseCfg)
 
 $c = New-BaseCfg; $n = New-BaseCfg
-$n.blockedSites     = @('YouTube.com', 'DOUYIN.COM')          # case differs
-$n.blockedProcesses = @('msedge', 'chrome', 'MSEDGE')         # order + duplicate
+$n.schedule.windows[0].blockedSites     = @('YouTube.com', 'DOUYIN.COM')          # case differs
+$n.schedule.windows[0].blockedProcesses = @('msedge', 'chrome', 'MSEDGE')         # order + duplicate
 Check 'case / order / duplicate only' $false $c $n
 
 $c = New-BaseCfg; $n = New-BaseCfg
@@ -79,11 +84,15 @@ $n.enabled  = $false
 Check 'unrelated fields (web/override/enabled)' $false $c $n
 
 $c = New-BaseCfg; $n = New-BaseCfg
-$n.schedule.windows = @(@{ start = '07:15'; end = '09:15' })   # rebuilt, same content
+$n.schedule.windows = @(@{
+    start = '07:15'; end = '09:15'
+    blockedSites = @('douyin.com', 'youtube.com')
+    blockedProcesses = @('chrome', 'msedge')
+})   # rebuilt, same content
 Check 'schedule.windows rebuilt identical' $false $c $n
 
 $c = New-BaseCfg; $n = New-BaseCfg
-$n.blockedSites = @('douyin.com', 'youtube.com', '')           # blank entry ignored
+$n.schedule.windows[0].blockedSites = @('douyin.com', 'youtube.com', '')           # blank entry ignored
 Check 'blank entry ignored' $false $c $n
 
 $c = New-BaseCfg
@@ -108,23 +117,17 @@ Check 'blockWebsites: truthy string equals bool' $false $c $n
 Write-Host ''
 Write-Host '--- B. classification: hard / widen / queue ---'
 
-$c = New-BaseCfg; $n = New-BaseCfg; $n.blockedSites += 'tiktok.com'
-CheckDiff 'blockedSites: add domain  (tighten)' @('queue') $c $n
+$c = New-BaseCfg; $n = New-BaseCfg; $n.schedule.windows[0].blockedSites += 'tiktok.com'
+CheckDiff 'window sites: add domain (tighten)' @('queue') $c $n
 
-$c = New-BaseCfg; $n = New-BaseCfg; $n.blockedSites = @('douyin.com')
-CheckDiff 'blockedSites: remove domain (widen)' @('widen') $c $n
+$c = New-BaseCfg; $n = New-BaseCfg; $n.schedule.windows[0].blockedSites = @('douyin.com')
+CheckDiff 'window sites: remove domain (widen)' @('widen') $c $n
 
-$c = New-BaseCfg; $n = New-BaseCfg; $n.blockedProcesses += 'steam'
-CheckDiff 'blockedProcesses: add process (tighten)' @('queue') $c $n
+$c = New-BaseCfg; $n = New-BaseCfg; $n.schedule.windows[0].blockedProcesses += 'steam'
+CheckDiff 'window processes: add process (tighten)' @('queue') $c $n
 
-$c = New-BaseCfg; $n = New-BaseCfg; $n.blockedProcesses = @('chrome')
-CheckDiff 'blockedProcesses: remove process (widen)' @('widen') $c $n
-
-$c = New-BaseCfg; $n = New-BaseCfg; $n.browser.windows += 'Entertainment'
-CheckDiff 'browser.windows: add workspace (tighten)' @('queue') $c $n
-
-$c = New-BaseCfg; $n = New-BaseCfg; $n.browser.windows = @()
-CheckDiff 'browser.windows: remove workspace (widen)' @('widen') $c $n
+$c = New-BaseCfg; $n = New-BaseCfg; $n.schedule.windows[0].blockedProcesses = @('chrome')
+CheckDiff 'window processes: remove process (widen)' @('widen') $c $n
 
 $c = New-BaseCfg; $n = New-BaseCfg; $n.blockWebsites = $false
 CheckDiff 'blockWebsites: turn ON -> OFF (widen)' @('widen') $c $n
@@ -140,22 +143,19 @@ $c = New-BaseCfg; $n = New-BaseCfg
 $c.browser.urlBlock = $true; $n.browser.urlBlock = $false
 CheckDiff 'browser.urlBlock: ON -> OFF (widen)' @('widen') $c $n
 
-$c = New-BaseCfg; $n = New-BaseCfg; $n.browser.enabled = $false
-CheckDiff 'browser.enabled: ON -> OFF (widen)' @('widen') $c $n
-
 $c = New-BaseCfg; $n = New-BaseCfg; $n.whitelist.sites += 'mail.example.com'
 CheckDiff 'whitelist.sites: add domain (widen)' @('widen') $c $n
 
 $c = New-BaseCfg; $n = New-BaseCfg
 $c.whitelist.sites = @('mail.example.com'); $n.whitelist.sites = @()
-CheckDiff 'whitelist.sites: remove domain (tighten)' @('queue') $c $n
+CheckDiff 'whitelist.sites: remove domain (widen)' @('widen') $c $n
 
 $c = New-BaseCfg; $n = New-BaseCfg; $n.whitelist.processes += 'teams'
 CheckDiff 'whitelist.processes: add process (widen)' @('widen') $c $n
 
 $c = New-BaseCfg; $n = New-BaseCfg
 $c.whitelist.processes = @('teams'); $n.whitelist.processes = @()
-CheckDiff 'whitelist.processes: remove process (tighten)' @('queue') $c $n
+CheckDiff 'whitelist.processes: remove process (widen)' @('widen') $c $n
 
 $c = New-BaseCfg; $n = New-BaseCfg; $n.schedule.days = @(1, 2, 3, 4)
 CheckDiff 'schedule.days -> hard' @('hard') $c $n
@@ -164,38 +164,44 @@ $c = New-BaseCfg; $n = New-BaseCfg; $n.schedule.windows = @(@{ start = '08:00'; 
 CheckDiff 'schedule.windows -> hard' @('hard') $c $n
 
 $c = New-BaseCfg; $n = New-BaseCfg
-$n.blockedSites += 'tiktok.com'
+$n.schedule.windows[0].blockedSites += 'tiktok.com'
 $n.schedule.days = @(1, 2, 3, 4, 5)
 CheckDiff 'add domain + change days -> hard+queue' @('hard','queue') $c $n
 
 $c = New-BaseCfg; $n = New-BaseCfg
-$n.blockedSites = @('douyin.com')
-$n.blockedProcesses += 'steam'
+$n.schedule.windows[0].blockedSites = @('douyin.com')
+$n.schedule.windows[0].blockedProcesses += 'steam'
 CheckDiff 'remove domain + add process -> widen+queue' @('widen','queue') $c $n
 
 $c = New-BaseCfg; $n = New-BaseCfg
 CheckDiff 'identical -> none' @('none') $c $n
 
 # 整块字段丢失(等价于把该名单全删 / 把开关全关) -> 放宽
-$c = New-BaseCfg; $n = New-BaseCfg; $n.Remove('browser')
+$c = New-BaseCfg; $n = New-BaseCfg; $c.browser.urlBlock = $true; $n.Remove('browser')
 CheckDiff 'browser field dropped -> widen' @('widen') $c $n
 
 $c = New-BaseCfg; $n = New-BaseCfg
 $c.whitelist.sites = @('mail.example.com')
 $n.Remove('whitelist')
-CheckDiff 'whitelist field dropped -> queue' @('queue') $c $n
+CheckDiff 'whitelist field dropped -> widen' @('widen') $c $n
 
 # ---------------------------------------------------------------
-# C. 放宽类只在"生效时段内"被拒; 收紧类在生效时段内也不算违规(它会去排队)
+# C. 放宽类在强制模式开启期间一律被拒; 收紧类不算违规
 # ---------------------------------------------------------------
 Write-Host ''
-Write-Host '--- C. widen rejected only while force is active ---'
+Write-Host '--- C. widen rejected while force mode is enabled ---'
 
-$c = New-BaseCfg; $n = New-BaseCfg; $n.blockedSites = @('douyin.com')
+$c = New-BaseCfg; $n = New-BaseCfg; $n.schedule.windows[0].blockedSites = @('douyin.com')
 Check 'remove domain'               $false                     $c $n
 Check 'remove domain'               $true  -ForceActive        $c $n
 
-$c = New-BaseCfg; $n = New-BaseCfg; $n.blockedSites += 'tiktok.com'
+$c = New-BaseCfg; $n = New-BaseCfg
+$c.force = @{ enabled = $true; weekdays = @(); until = $null }
+$n.force = @{ enabled = $true; weekdays = @(); until = $null }
+$n.schedule.windows[0].blockedProcesses = @('chrome')
+Check 'force enabled: remove process outside window' $true $c $n
+
+$c = New-BaseCfg; $n = New-BaseCfg; $n.schedule.windows[0].blockedSites += 'tiktok.com'
 Check 'add domain (goes to queue)'  $false                     $c $n
 Check 'add domain (goes to queue)'  $false -ForceActive        $c $n
 
@@ -207,7 +213,7 @@ Check 'add to whitelist'            $true  -ForceActive        $c $n
 
 $c = New-BaseCfg; $n = New-BaseCfg
 $c.whitelist.sites = @('mail.example.com'); $n.whitelist.sites = @()
-Check 'remove from whitelist'       $false -ForceActive        $c $n
+Check 'remove from whitelist'       $true  -ForceActive        $c $n
 
 $c = New-BaseCfg; $n = New-BaseCfg
 Check 'untouched config'            $false -ForceActive        $c $n
@@ -215,13 +221,10 @@ Check 'untouched config'            $false -ForceActive        $c $n
 $c = New-BaseCfg; $n = New-BaseCfg; $n.schedule.days = @(1, 2)
 Check 'schedule still hard'         $true  -ForceActive        $c $n
 
-$c = New-BaseCfg; $n = New-BaseCfg; $n.Remove('browser')
+$c = New-BaseCfg; $n = New-BaseCfg; $c.browser.urlBlock = $true; $n.Remove('browser')
 Check 'browser field dropped'       $true  -ForceActive        $c $n
 
-$c = New-BaseCfg; $n = New-BaseCfg; $n.browser.windows = @()
-Check 'clear workspace list'        $true  -ForceActive        $c $n
-
-$c = New-BaseCfg; $n = New-BaseCfg; $n.blockedProcesses = @()
+$c = New-BaseCfg; $n = New-BaseCfg; $n.schedule.windows[0].blockedProcesses = @()
 Check 'clear process list'          $true  -ForceActive        $c $n
 
 # ---------------------------------------------------------------
@@ -231,12 +234,11 @@ Write-Host ''
 Write-Host '--- D. pending patch carries tighten-only changes ---'
 
 $c = New-BaseCfg; $n = New-BaseCfg
-$n.blockedSites += 'tiktok.com'
-$n.blockedProcesses += 'steam'
-$n.browser.windows += 'Fun'
+$n.schedule.windows[0].blockedSites += 'tiktok.com'
+$n.schedule.windows[0].blockedProcesses += 'steam'
 $np = New-AfsPendingPatch -Current $c -Incoming $n
 $pk = (@($np.patch.Keys) | Sort-Object) -join ','
-$okPatch = (($pk -eq 'blockedProcesses,blockedSites,browser') -and ($np.total -ge 3))
+$okPatch = (($pk -eq 'schedule') -and ($np.total -ge 2))
 if (-not $okPatch) { $script:bad++ }
 Write-Host (($(if ($okPatch) { 'OK  ' } else { 'FAIL' })) + ' ' + 'patch'.PadRight(7) + " tighten patch keys=[$pk] total=$($np.total)")
 
@@ -246,7 +248,7 @@ $okHard = (@($np2.patch.Keys).Count -eq 0) -and ([int]$np2.total -eq 0)
 if (-not $okHard) { $script:bad++ }
 Write-Host (($(if ($okHard) { 'OK  ' } else { 'FAIL' })) + ' ' + 'patch'.PadRight(7) + " schedule change never queued (total=$($np2.total))")
 
-$c = New-BaseCfg; $n = New-BaseCfg; $n.blockedSites = @('douyin.com')
+$c = New-BaseCfg; $n = New-BaseCfg; $n.schedule.windows[0].blockedSites = @('douyin.com')
 $np3 = New-AfsPendingPatch -Current $c -Incoming $n
 $okRem = (@($np3.patch.Keys).Count -eq 0) -and ([int]$np3.total -eq 0)
 if (-not $okRem) { $script:bad++ }
@@ -256,9 +258,9 @@ $c = New-BaseCfg; $n = New-BaseCfg
 $c.blockWebsites = $false; $n.blockWebsites = $true
 $c.whitelist.sites = @('mail.example.com'); $n.whitelist.sites = @()
 $np4 = New-AfsPendingPatch -Current $c -Incoming $n
-$okMix = ((@($np4.patch.Keys) | Sort-Object) -join ',') -eq 'blockWebsites,whitelist'
+$okMix = ((@($np4.patch.Keys) | Sort-Object) -join ',') -eq 'blockWebsites'
 if (-not $okMix) { $script:bad++ }
-Write-Host (($(if ($okMix) { 'OK  ' } else { 'FAIL' })) + ' ' + 'patch'.PadRight(7) + " switch-on + whitelist-shrink queued (total=$($np4.total))")
+Write-Host (($(if ($okMix) { 'OK  ' } else { 'FAIL' })) + ' ' + 'patch'.PadRight(7) + " switch-on queued; whitelist shrink stays blocked (total=$($np4.total))")
 
 $c = New-BaseCfg; $n = New-BaseCfg
 $c.blockWebsites = $false; $n.blockWebsites = $true
@@ -280,14 +282,16 @@ Set-AfsConfigPath -Path (Join-Path $qdir 'config.json')
 $bc = Get-AfsDefaultConfig
 $bc.force.enabled    = $true
 $bc.schedule.days    = @(1, 2, 3, 4, 5, 6, 7)
-$bc.schedule.windows = @(@{ start = '00:00'; end = '23:59' })   # 全天窗口 -> 当前必然处于强制生效时段
-$bc.blockedSites     = @('douyin.com', 'youtube.com')
-$bc.blockedProcesses = @('chrome')
+$bc.schedule.windows = @(@{
+    start = '00:00'; end = '23:59'   # 全天窗口 -> 当前必然处于强制生效时段
+    blockedSites = @('douyin.com', 'youtube.com')
+    blockedProcesses = @('chrome')
+})
 $bc.whitelist        = @{ sites = @('keep.example.com'); processes = @('teams') }
-Set-AfsConfigSafe -InputConfig $bc | Out-Null
+Set-AfsConfigSafe -InputConfig $bc -AllowForceChange | Out-Null
 
 $want = Get-AfsConfig
-$want.blockedSites = @($want.blockedSites) + @('queued-demo.com')
+$want.schedule.windows[0].blockedSites = @($want.schedule.windows[0].blockedSites) + @('queued-demo.com')
 $qs = Save-AfsPendingQueue -Current (Get-AfsConfig) -Incoming $want
 CheckBool 'pending 写入成功 (total>0)' $true ([int]$qs.total -gt 0)
 CheckBool 'pending 文件存在' $true (Test-Path (Get-AfsPendingPath))
@@ -296,22 +300,24 @@ $r1 = Invoke-AfsPendingApply
 CheckBool '生效时段内 -> 不落地' $false $r1.applied
 CheckBool '生效时段内 -> 原因 force-active' $true ($r1.reason -eq 'force-active')
 CheckBool '生效时段内 -> 队列保留' $true (Test-Path (Get-AfsPendingPath))
-CheckBool '生效时段内 -> config 未被改' $false (@(Get-AfsConfig).blockedSites -contains 'queued-demo.com')
+CheckBool '生效时段内 -> config 未被改' $false (@((Get-AfsConfig).schedule.windows[0].blockedSites) -contains 'queued-demo.com')
 
-# 把窗口挪到"已经过去的 1 分钟" -> 现在是非屏蔽时段
+# 把生效星期挪到明天 -> 窗口内容不变, 但现在不是强制生效时段, 队列可以正常落地。
 $c2 = Get-AfsConfig
-$c2.schedule.windows = @(@{ start = '00:00'; end = '00:01' })
+$tomorrowNum = [int](Get-Date).AddDays(1).DayOfWeek
+if ($tomorrowNum -eq 0) { $tomorrowNum = 7 }
+$c2.schedule.days = @($tomorrowNum)
 Set-AfsConfigSafe -InputConfig $c2 | Out-Null
 
 $r2 = Invoke-AfsPendingApply
 CheckBool '非屏蔽时段 -> 自动落地' $true $r2.applied
-CheckBool '落地后 config 已有排队内容' $true (@(Get-AfsConfig).blockedSites -contains 'queued-demo.com')
+CheckBool '落地后 config 已有排队内容' $true (@((Get-AfsConfig).schedule.windows[0].blockedSites) -contains 'queued-demo.com')
 CheckBool '落地后队列已清空' $false (Test-Path (Get-AfsPendingPath))
 CheckBool '落地后 force.enabled 仍保持开启' $true ([bool](Get-AfsConfig).force.enabled)
 # 补丁里没有 whitelist 时表示"白名单没动", 不能被当成清空
 CheckBool '落地后白名单域名原样保留' $true (@(Get-AfsConfig).whitelist.sites -contains 'keep.example.com')
 CheckBool '落地后白名单进程原样保留' $true (@(Get-AfsConfig).whitelist.processes -contains 'teams')
-CheckBool '落地后原屏蔽项没丢' $true (@(Get-AfsConfig).blockedSites -contains 'douyin.com')
+CheckBool '落地后原屏蔽项没丢' $true (@((Get-AfsConfig).schedule.windows[0].blockedSites) -contains 'douyin.com')
 
 # 手工篡改队列文件: 塞进"删屏蔽项 / 关开关 / 加白名单 / 改屏蔽时段"
 $tamper = @{
@@ -324,7 +330,11 @@ $tamper = @{
     patch     = @{
         blockedSites  = @()                                   # 想清空屏蔽域名
         blockWebsites = $false                                # 想关掉总开关
-        schedule      = @{ days = @(1); windows = @(@{ start = '00:00'; end = '00:05' }) }
+        schedule      = @{ days = @(1); windows = @(@{
+            start = '00:00'; end = '00:05'
+            blockedSites = @()
+            blockedProcesses = @()
+        }) }
         whitelist     = @{ sites = @('keep.example.com', 'evil.com') }
     }
 }
@@ -332,9 +342,9 @@ Write-AfsJson -Path (Get-AfsPendingPath) -Object $tamper
 $r3 = Invoke-AfsPendingApply
 $after = Get-AfsConfig
 CheckBool '被篡改的队列仍然落地' $true $r3.applied
-CheckBool '篡改无效: 屏蔽域名没被清空' $true (@($after.blockedSites).Count -eq @(Get-AfsConfig).blockedSites.Count -and (@($after.blockedSites) -contains 'douyin.com'))
+CheckBool '篡改无效: 屏蔽域名没被清空' $true (@($after.schedule.windows[0].blockedSites).Count -eq @((Get-AfsConfig).schedule.windows[0].blockedSites).Count -and (@($after.schedule.windows[0].blockedSites) -contains 'douyin.com'))
 CheckBool '篡改无效: 总开关没被关掉' $true ([bool]$after.blockWebsites)
-CheckBool '篡改无效: 屏蔽时段没被改' $true (("$($after.schedule.windows[0].start)-$($after.schedule.windows[0].end)") -eq '00:00-00:01')
+CheckBool '篡改无效: 屏蔽时段没被改' $true (("$($after.schedule.windows[0].start)-$($after.schedule.windows[0].end)") -eq '00:00-23:59')
 CheckBool '篡改无效: 白名单没被塞进 evil.com' $false (@($after.whitelist.sites) -contains 'evil.com')
 CheckBool '原白名单项仍保留' $true (@($after.whitelist.sites) -contains 'keep.example.com')
 
@@ -355,7 +365,7 @@ $uc = Get-AfsDefaultConfig
 $uc.force.enabled    = $true
 $uc.schedule.days    = @(1, 2, 3, 4, 5, 6, 7)
 $uc.schedule.windows = @(@{ start = '00:00'; end = '23:59' })   # 全天窗口 -> 必然生效中
-Set-AfsConfigSafe -InputConfig $uc | Out-Null
+Set-AfsConfigSafe -InputConfig $uc -AllowForceChange | Out-Null
 Save-AfsForceState -Until $null          # 与面板 /api/force 开启时一致: 写独立状态文件(双保险来源2)
 $g1 = Get-AfsUninstallBlock
 CheckBool '生效时段内 -> 禁止卸载' $true $g1.blocked
@@ -376,7 +386,7 @@ $uc2b.force.enabled    = $true
 $uc2b.force.weekdays   = @(1, 2, 3, 4, 5)                        # 只强制周一到周五
 $uc2b.schedule.days    = @(1, 2, 3, 4, 5, 6, 7)
 $uc2b.schedule.windows = @(@{ start = '00:00'; end = '23:59' })
-Set-AfsConfigSafe -InputConfig $uc2b | Out-Null
+Set-AfsConfigSafe -InputConfig $uc2b -AllowForceChange | Out-Null
 $satNow = [datetime]'2026-09-26 18:00'    # 周六 (非强制星期)
 $monNow = [datetime]'2026-09-28 18:00'    # 周一 (强制星期 + 全天窗口)
 $g2b = Get-AfsUninstallBlock -Now $satNow
@@ -416,7 +426,7 @@ $uc6 = Get-AfsDefaultConfig
 $uc6.force.enabled    = $true
 $uc6.schedule.days    = @(1, 2, 3, 4, 5, 6, 7)
 $uc6.schedule.windows = @(@{ start = '00:00'; end = '23:59' })
-Set-AfsConfigSafe -InputConfig $uc6 | Out-Null
+Set-AfsConfigSafe -InputConfig $uc6 -AllowForceChange | Out-Null
 Remove-Item (Get-AfsForceStatePath) -Force -ErrorAction SilentlyContinue
 $enforceErr = ''
 try { $null = Invoke-AfsEnforce -Config (Get-AfsConfig) -HostsPath (Join-Path $udir2 'fake-hosts') -Simulate } catch { $enforceErr = $_.Exception.Message }
@@ -465,6 +475,35 @@ CheckDiff 'force weekdays duplicated only'   @('none') $gc $gn6
 $gc2 = New-BaseCfg; $gc2.force = @{ enabled = $false; until = $null; weekdays = @() }
 $gn7 = New-BaseCfg; $gn7.force = @{ enabled = $true; until = $null; weekdays = @(1, 2, 3, 4, 5) }
 CheckDiff 'turn force on via config'         @('hard') $gc2 $gn7
+
+# ---------------------------------------------------------------
+# H. 普通配置落盘不能改强制模式: 旧页面保存整份快照也不能把 force 写回开启
+# ---------------------------------------------------------------
+Write-Host ''
+Write-Host '--- H. ordinary config saves preserve the persisted force block ---'
+
+$fdir = Join-Path $env:TEMP ('afs-verify-force-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Force -Path $fdir | Out-Null
+Set-AfsConfigPath -Path (Join-Path $fdir 'config.json')
+
+Set-AfsConfigSafe -InputConfig (Get-AfsDefaultConfig) -AllowForceChange | Out-Null
+$stale = Get-AfsConfig
+$stale.force = @{ enabled = $true; until = $null; weekdays = @(1, 2, 3, 4, 5, 6, 7) }
+Set-AfsConfigSafe -InputConfig $stale | Out-Null
+CheckBool '普通保存: closed stays closed' $false ([bool](Get-AfsConfig).force.enabled)
+
+$open = Get-AfsConfig
+$open.force = @{ enabled = $true; until = $null; weekdays = @(1, 2, 3, 4, 5, 6, 7) }
+Set-AfsConfigSafe -InputConfig $open -AllowForceChange | Out-Null
+$off = Get-AfsConfig
+$off.force = @{ enabled = $false; until = $null; weekdays = @() }
+Set-AfsConfigSafe -InputConfig $off | Out-Null
+CheckBool '普通保存: open stays open' $true ([bool](Get-AfsConfig).force.enabled)
+
+Set-AfsConfigSafe -InputConfig $off -AllowForceChange | Out-Null
+CheckBool '专用写入: can explicitly close' $false ([bool](Get-AfsConfig).force.enabled)
+
+Remove-Item -LiteralPath $fdir -Recurse -Force -ErrorAction SilentlyContinue
 
 Remove-Item -LiteralPath $udir  -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $udir2 -Recurse -Force -ErrorAction SilentlyContinue

@@ -37,6 +37,8 @@ Write-Host '[1/6] 删除计划任务...'
 schtasks /Delete /TN "AwayFromShorts" /F 2>&1 | Out-Null
 schtasks /Delete /TN "AwayFromShorts-BrowserClose" /F 2>&1 | Out-Null
 schtasks /Delete /TN "AwayFromShorts-WebUI" /F 2>&1 | Out-Null
+Stop-ScheduledTask -TaskName 'AwayFromShorts-GameQuota' -ErrorAction SilentlyContinue
+schtasks /Delete /TN "AwayFromShorts-GameQuota" /F 2>&1 | Out-Null
 
 # 2. 恢复 hosts(移除本程序的标记块)
 Write-Host '[2/6] 恢复 hosts 文件...'

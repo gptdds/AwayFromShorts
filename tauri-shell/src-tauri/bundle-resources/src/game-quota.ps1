@@ -53,12 +53,38 @@ function Stop-AfsGameQuotaProcesses {
 }
 
 function Stop-AfsAppQuotaProcesses {
-    param([object[]]$Processes, [object[]]$Rules)
+    param([object[]]$Processes, [object[]]$Rules, [datetime]$Now=(Get-Date))
+    $activeRules = @($Rules | Where-Object { Test-AfsQuotaRuleActive $_ $Now })
     foreach ($proc in $Processes) {
-        if (@(Get-AfsQuotaMatches $proc.ProcessName $proc.Path $Rules).Count -eq 0) { continue }
+        if (@(Get-AfsQuotaMatches $proc.ProcessName $proc.Path $activeRules).Count -eq 0) { continue }
         try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop }
         catch { if (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) { $proc.ProcessName } }
     }
+}
+
+function Get-AfsQuotaBrowserHost {
+    param([IntPtr]$Window)
+    try {
+        Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+        $root = [Windows.Automation.AutomationElement]::FromHandle($Window)
+        $edits = [Windows.Automation.PropertyCondition]::new(
+            [Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Edit)
+        foreach ($element in $root.FindAll([Windows.Automation.TreeScope]::Descendants, $edits)) {
+            if ($element.Current.AutomationId -ne 'addressEdit' -and
+                $element.Current.Name -notin @('Address and search bar','地址和搜索栏','地址和搜尋列','地址栏和搜索栏')) { continue }
+            $parent = [Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($element)
+            while ($parent -and $parent.Current.ControlType -ne [Windows.Automation.ControlType]::Document -and
+                -not $parent.Equals($root)) {
+                $parent = [Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($parent)
+            }
+            if (-not $parent -or -not $parent.Equals($root)) { continue }
+            if ($element.Current.HasKeyboardFocus -or $element.Current.IsOffscreen) { return }
+            $pattern = $null
+            if ($element.TryGetCurrentPattern([Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
+                return (ConvertTo-AfsQuotaWebsiteHost $pattern.Current.Value)
+            }
+        }
+    } catch { }
 }
 
 if ($LibraryOnly) { return }
@@ -99,8 +125,9 @@ try {
     # re-reads it at most every 2s. Reading on every 1s tick would double the
     # file IO for no visible gain -- 2s is already "locked before you notice".
     $lastSharedRead = -99.0
-    $sharedUsed = 0.0
-    $poolMinutes = 0
+    # rule id -> @{ usedSeconds; minutes }. Each cross-device cell keeps its own
+    # phone slice, so exhaustion of one pool must not drain another.
+    $sharedPools = @{}
     while ($true) {
         $tick = $watch.Elapsed.TotalSeconds
         $elapsed = $tick - $lastTick
@@ -109,37 +136,27 @@ try {
         if (-not (Test-Path -LiteralPath $configFile)) { Start-Sleep -Seconds 1; continue }
         $config = ConvertTo-AfsAppQuotaConfig (Read-AfsJson $configFile)
         if ($null -eq $state) { $state = Read-AfsAppQuotaState $stateFile $now }
-        $sharedRule = $null
-        foreach ($r in $config.rules) { if ($r.ContainsKey('shared') -and [bool]$r.shared) { $sharedRule = $r } }
-        if ($null -ne $sharedRule) {
-            if (($tick - $lastSharedRead) -ge 2) {
-                $lastSharedRead = $tick
-                $lanCfg = Get-AfsQuotaLanConfig $DataDir
-                if ($lanCfg.enabled) {
-                    $sharedUsed = [double](Read-AfsQuotaLanState $DataDir $now).phoneUsedSeconds
-                } else {
-                    $sharedUsed = 0.0
-                }
-                $poolMinutes = [int]$sharedRule.dailyMinutes
-            }
-        } else {
-            $sharedUsed = 0.0; $poolMinutes = 0
+        if (($tick - $lastSharedRead) -ge 2) {
+            $lastSharedRead = $tick
+            $sharedPools = Get-AfsQuotaSharedUsage $DataDir $now $config.rules
         }
-        $state = Update-AfsAppQuotaState $state $config $now $elapsed $foregroundIds $sharedUsed $poolMinutes
+        $state = Update-AfsAppQuotaState $state $config $now $elapsed $foregroundIds 0 0 $sharedPools
         $hwnd = [AfsWin32.Native]::GetForegroundWindow()
         $foregroundId = [uint32]0
         if ($hwnd -ne [IntPtr]::Zero) { [void][AfsWin32.Native]::GetWindowThreadProcessId($hwnd, [ref]$foregroundId) }
         $foregroundIds = @()
         $failed = @()
-        $exhaustedRules = @($config.rules | Where-Object { $state.apps[$_.id].exhausted })
-        if ($config.enabled -and $exhaustedRules.Count -gt 0) {
+        $activeRules = @($config.rules | Where-Object { Test-AfsQuotaRuleActive $_ $now })
+        $exhaustedRules = @($activeRules | Where-Object { $state.apps[$_.id].exhausted })
+        $exhaustedApps = @($exhaustedRules | Where-Object { $_.type -in @('games','steam','valorant','process') -or $_.processes })
+        if ($config.enabled -and $exhaustedApps.Count -gt 0) {
             # Fetch executable paths in one OS query instead of opening every
             # process individually (slow for protected/elevated processes).
             $sessionId = (Get-Process -Id $PID).SessionId
             $processes = @(Get-CimInstance Win32_Process -Filter "SessionId=$sessionId" | ForEach-Object {
                 [pscustomobject]@{Id=$_.ProcessId; ProcessName=($_.Name -replace '\.exe$', ''); Path=$_.ExecutablePath}
             })
-            $failed = @(Stop-AfsAppQuotaProcesses $processes $exhaustedRules)
+            $failed = @(Stop-AfsAppQuotaProcesses $processes $exhaustedApps $now)
         }
         if ($config.enabled -and $foregroundId -gt 0) {
             # Normal counting only needs the foreground process. Scanning every
@@ -148,7 +165,26 @@ try {
             if ($proc) {
                 $path = ''
                 try { $path = $proc.Path } catch { }
-                $availableRules = @($config.rules | Where-Object { -not $state.apps[$_.id].exhausted }); $foregroundIds = @(Get-AfsForegroundQuotaTarget $proc.ProcessName $path $availableRules)
+                $availableRules = @($activeRules | Where-Object { -not $state.apps[$_.id].exhausted })
+                $foregroundIds = @(Get-AfsForegroundQuotaTarget $proc.ProcessName $path $availableRules)
+                if ($proc.ProcessName -in @('chrome','msedge','brave','vivaldi') -and
+                    @($activeRules | Where-Object { $_.type -eq 'website' -or $_.websites }).Count) {
+                    $websiteHost = Get-AfsQuotaBrowserHost $hwnd
+                    if (@(Get-AfsQuotaWebsiteMatches $websiteHost $exhaustedRules).Count) {
+                        try {
+                            Add-Type -AssemblyName System.Windows.Forms
+                            if ((Get-AfsQuotaBrowserHost $hwnd) -eq $websiteHost -and
+                                [AfsWin32.Native]::GetForegroundWindow() -eq $hwnd) {
+                                [Windows.Forms.SendKeys]::SendWait('^w')
+                            }
+                        } catch { $failed += $websiteHost }
+                    } else {
+                        $websiteRules = @($availableRules | Where-Object {
+                            ($_.type -eq 'website' -or $_.websites) -and $foregroundIds[0] -notin @(Get-AfsQuotaTargetIds $_)
+                        })
+                        $foregroundIds += @(Get-AfsQuotaWebsiteMatches $websiteHost $websiteRules)
+                    }
+                }
             }
         }
         $state.foregroundIds = $foregroundIds

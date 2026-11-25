@@ -81,6 +81,10 @@ try {
         Write-Host "-----------------------------------"
         exit 0
     }
+    # Updating files does not restart an already-running WebUI loop. Stop the
+    # old instance before replacing the task so the next launch loads new code.
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 400
     schtasks /Create /F /TN $TaskName /XML $xmlPath 2>&1 | Out-Null
     $code = $LASTEXITCODE
     if ($code -eq 0) {

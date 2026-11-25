@@ -7,7 +7,8 @@
 #
 # Surface is deliberately tiny: exactly one path, one token, two verbs.
 #   GET  /quota?token=...               -> pool view, no writes
-#   POST /quota?token=...  {usedSeconds, group} -> phone reports its slice
+#   POST /quota?token=...  {usedSeconds, group} -> legacy single-pool report
+#   POST /quota?token=...  {pools:[{id, group, usedSeconds, apps}]} -> multi-pool report
 # A device on the same wifi without the token gets 403 and nothing else.
 #
 # Runs from the scheduled task 'AwayFromShorts-QuotaLan', hidden window.
@@ -75,7 +76,7 @@ function Read-LanRequest {
     foreach ($line in ($headerText -split "`r`n")) {
         if ($line -match '^(?i)Content-Length:\s*(\d+)') { $contentLength = [int]$Matches[1] }
     }
-    if ($contentLength -lt 0 -or $contentLength -gt 8192) { $contentLength = 0 }
+    if ($contentLength -lt 0 -or $contentLength -gt 65536) { $contentLength = 0 }
     $bodyBytes = New-Object System.Collections.Generic.List[byte]
     $have = $snapshot.Length - ($headerEnd + 4)
     if ($have -gt 0) { for ($i = 0; $i -lt [Math]::Min($have, $contentLength); $i++) { $bodyBytes.Add($snapshot[$headerEnd + 4 + $i]) } }
@@ -124,6 +125,31 @@ function Test-LanToken {
     [string]::Equals($given, $Expected, [StringComparison]::Ordinal)
 }
 
+function Read-LanQuotaReport {
+    param($Obj)
+    if ($null -eq $Obj) { return $null }
+    $used = -1.0
+    if ($null -ne $Obj.usedSeconds) { [void][double]::TryParse([string]$Obj.usedSeconds, [ref]$used) }
+    if ($used -lt 0 -or [double]::IsNaN($used) -or [double]::IsInfinity($used) -or $used -gt 86400) { return $null }
+    $apps = @()
+    $hasApps = $false
+    if ($null -ne $Obj.apps) {
+        $hasApps = $true
+        foreach ($a in @($Obj.apps)) {
+            if ($null -eq $a) { continue }
+            $apps += @{ name = [string]$a.name; seconds = [string]$a.seconds }
+            if ($apps.Count -ge 30) { break }
+        }
+    }
+    @{
+        id = [string]$Obj.id
+        used = $used
+        group = [string]$Obj.group
+        apps = @($apps)
+        hasApps = $hasApps
+    }
+}
+
 function Get-LanAddresses {
     try {
         @([System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
@@ -170,8 +196,8 @@ try {
 
 Write-LanLog 'INFO' ("listening on 0.0.0.0:$port  addresses=" + ((Get-LanAddresses) -join ','))
 
-$lastPhoneWrite = [datetime]::MinValue
-$lastPhoneUsed = -1.0
+$lastPoolWrite = @{}
+$lastPoolUsed = @{}
 $lastConfigCheck = Get-Date
 $lastEnabled = $true
 while ($true) {
@@ -212,40 +238,55 @@ while ($true) {
         }
         $now = Get-Date
         if ($req.method -eq 'POST') {
-            $used = -1.0
-            $group = ''
-            $apps = @()
-            $hasApps = $false
+            $reports = @()
             if ($req.body) {
                 try {
                     $o = $req.body | ConvertFrom-Json -ErrorAction Stop
-                    if ($null -ne $o.usedSeconds) { [void][double]::TryParse([string]$o.usedSeconds, [ref]$used) }
-                    if ($null -ne $o.group) { $group = [string]$o.group }
-                    # Per-app slice: display-only, so a malformed entry is skipped
-                    # rather than rejecting the whole report.
-                    if ($null -ne $o.apps) {
-                        $hasApps = $true
-                        foreach ($a in @($o.apps)) {
-                            if ($null -eq $a) { continue }
-                            $apps += @{ name = [string]$a.name; seconds = [string]$a.seconds }
-                            if ($apps.Count -ge 30) { break }
+                    if ($null -ne $o.pools) {
+                        foreach ($p in @($o.pools)) {
+                            $report = Read-LanQuotaReport $p
+                            if ($null -ne $report) { $reports += $report }
                         }
+                    } elseif ($null -ne $o.usedSeconds) {
+                        # Old phone build: no pool id. The first shared rule claims it.
+                        $legacy = Read-LanQuotaReport $o
+                        if ($null -ne $legacy) { $reports += $legacy }
                     }
                 } catch { }
             }
-            if ($used -ge 0 -and -not [double]::IsNaN($used) -and $used -le 86400) {
-                # 2s coalescing: the phone polls every 3s, but a sticky network can
-                # retry in a burst and write the same number five times.
-                if (([Math]::Abs($used - $lastPhoneUsed) -gt 0.4) -or (($now - $lastPhoneWrite).TotalSeconds -ge 2)) {
-                    # 旧版手机只报总数（body 里没有 apps）：沿用上一次的明细，
-                    # 否则升级前攒下的「哪个应用花了多少」会被每次轮询清空。
-                    if (-not $hasApps) {
-                        $apps = @((Read-AfsQuotaLanState -DataDir $DataDir -Now $now).phoneApps)
+            if ($reports.Count -gt 0) {
+                $sharedRules = @(Get-AfsQuotaSharedRules $DataDir)
+                $legacyId = if ($sharedRules.Count -gt 0) { [string]$sharedRules[0].id } else { '' }
+                $stateBefore = Read-AfsQuotaLanState -DataDir $DataDir -Now $now
+                $writeReports = @{}
+                $index = 0
+                foreach ($report in $reports) {
+                    $id = [string]$report.id
+                    if (-not $id) { $id = $legacyId }
+                    if (-not $id) { $index++; continue }
+                    $prevUsed = if ($lastPoolUsed.ContainsKey($id)) { [double]$lastPoolUsed[$id] } else { -1.0 }
+                    $prevAt = if ($lastPoolWrite.ContainsKey($id)) { [datetime]$lastPoolWrite[$id] } else { [datetime]::MinValue }
+                    # 2s coalescing: the phone polls every 3s, but a sticky network can
+                    # retry in a burst and write the same number five times.
+                    if (([Math]::Abs([double]$report.used - $prevUsed) -gt 0.4) -or (($now - $prevAt).TotalSeconds -ge 2)) {
+                        $apps = @($report.apps)
+                        # 旧版手机只报总数（body 里没有 apps）：沿用上一次的明细，
+                        # 否则升级前攒下的「哪个应用花了多少」会被每次轮询清空。
+                        if (-not $report.hasApps) {
+                            $existing = Get-AfsQuotaLanPoolState -State $stateBefore -PoolId $id -AllowLegacy:($index -eq 0)
+                            $apps = @($existing.phoneApps)
+                        }
+                        $writeReports[$id] = @{
+                            phoneUsedSeconds = [double]$report.used
+                            phoneGroup = [string]$report.group
+                            phoneApps = @($apps)
+                        }
+                        $lastPoolWrite[$id] = $now
+                        $lastPoolUsed[$id] = [double]$report.used
                     }
-                    Write-AfsQuotaLanState -DataDir $DataDir -Now $now -PhoneUsedSeconds $used -PhoneGroup $group -PhoneApps $apps
-                    $lastPhoneWrite = $now
-                    $lastPhoneUsed = $used
+                    $index++
                 }
+                if ($writeReports.Count -gt 0) { Write-AfsQuotaLanPools -DataDir $DataDir -Now $now -Reports $writeReports }
             }
         }
         $view = Get-AfsQuotaPoolView -DataDir $DataDir -Now $now

@@ -100,11 +100,11 @@ cargo tauri build
 
 构建产物：
 - exe: `src-tauri\target\release\awayfromshorts-shell.exe`（约 12 MB）
-- 安装器: `src-tauri\target\release\bundle\nsis\AwayFromShorts_2.0.0_x64-setup.exe`
+- 安装器: `src-tauri\target\release\bundle\nsis\AwayFromShorts_2.1.3_x64-setup.exe`
 
 ## 运行
 
-**正式使用：运行 NSIS 安装器** `AwayFromShorts_2.0.0_x64-setup.exe`，它会把 exe 装到
+**正式使用：运行 NSIS 安装器** `AwayFromShorts_2.1.3_x64-setup.exe`，它会把 exe 装到
 `%LOCALAPPDATA%\AwayFromShorts`（纯 ASCII 路径），装完双击桌面/开始菜单快捷方式即可。
 
 ```powershell

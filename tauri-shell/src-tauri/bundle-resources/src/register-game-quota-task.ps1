@@ -14,5 +14,7 @@ $xml = @"
 </Task>
 "@
 if ($DryRun) { return $xml }
+Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 400
 Register-ScheduledTask -TaskName $taskName -Xml $xml -Force | Out-Null
 Start-ScheduledTask -TaskName $taskName
