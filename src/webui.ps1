@@ -46,9 +46,11 @@ $script:StudyDbPath = Join-Path $PSScriptRoot 'study-db.json'
 # ---------------- 基础 HTTP ---------------
 
 function Send-AfsResponse {
-    param($Stream, [int]$Status, [string]$Type, $Body)
+    param($Stream, [int]$Status, [string]$Type, $Body, [string[]]$ExtraHeaders = @())
     $bytes = if ($Body -is [byte[]]) { $Body } else { [System.Text.Encoding]::UTF8.GetBytes([string]$Body) }
-    $head = "HTTP/1.1 $Status`r`nContent-Type: $Type`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`nCache-Control: no-store`r`n`r`n"
+    $extra = ''
+    if ($ExtraHeaders.Count -gt 0) { $extra = ($ExtraHeaders -join "`r`n") + "`r`n" }
+    $head = "HTTP/1.1 $Status`r`nContent-Type: $Type`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`nCache-Control: no-store`r`n$extra`r`n"
     $hb = [System.Text.Encoding]::ASCII.GetBytes($head)
     $Stream.Write($hb, 0, $hb.Length)
     if ($bytes.Length -gt 0) { $Stream.Write($bytes, 0, $bytes.Length) }
@@ -56,9 +58,9 @@ function Send-AfsResponse {
 }
 
 function Send-AfsJson {
-    param($Stream, [int]$Status, $Obj)
+    param($Stream, [int]$Status, $Obj, [string[]]$ExtraHeaders = @())
     $json = ConvertTo-Json $Obj -Depth 12 -Compress
-    Send-AfsResponse -Stream $Stream -Status $Status -Type 'application/json; charset=utf-8' -Body $json
+    Send-AfsResponse -Stream $Stream -Status $Status -Type 'application/json; charset=utf-8' -Body $json -ExtraHeaders $ExtraHeaders
 
 }
 # ---------------- 学习台: 本地库 ----------------
@@ -241,6 +243,7 @@ $handler = {
         $head = $null
         $contentLength = 0
         $headBytesLen = 0
+        $originHeader = ''
 
         # 读请求头 (字节累积, 之后按字节切 body —— 字符数 vs Content-Length 字节数混用会导致中文 body 误判未读完)
         while ($true) {
@@ -255,6 +258,7 @@ $handler = {
                 $headBytesLen = [System.Text.Encoding]::UTF8.GetByteCount($headStr) + 4
                 foreach ($line in ($headStr -split "`r`n")) {
                     if ($line -match '^Content-Length:\s*(\d+)') { $contentLength = [int]$Matches[1] }
+                    if ($line -match '^Origin:\s*(.+)$') { $originHeader = $Matches[1].Trim() }
                 }
                 break
             }
@@ -377,6 +381,94 @@ $handler = {
             }
             return
         }
+        if ($method -eq 'GET' -and $path -eq '/api/playback/monitor') {
+            Send-AfsJson -Stream $stream -Status 200 -Obj @{ ok = $true; monitor = (Get-AfsPlaybackMonitorView $PSScriptRoot) }
+            return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/playback/monitor') {
+            try {
+                $incoming = ConvertTo-AfsHashtable (ConvertFrom-Json $body -ErrorAction Stop)
+                if ($null -eq $incoming -or $incoming -isnot [hashtable]) { $incoming = @{} }
+                $current = Get-AfsPlaybackMonitorConfig $PSScriptRoot
+                $next = @{
+                    enabled = $current.enabled
+                    url = $current.url
+                    host = $current.host
+                    token = $current.token
+                    openAt = $current.openAt
+                }
+                if ($incoming.ContainsKey('enabled')) { $next.enabled = [bool]$incoming.enabled }
+                if ($incoming.ContainsKey('url')) { $next.url = ([string]$incoming.url).Trim() }
+                if ($incoming.ContainsKey('open') -and [bool]$incoming.open) {
+                    $next.openAt = (Get-Date).ToString('o')
+                }
+                $saved = Save-AfsPlaybackMonitorConfig -DataDir $PSScriptRoot -Config $next
+                Send-AfsJson -Stream $stream -Status 200 -Obj @{
+                    ok = $true
+                    monitor = (Get-AfsPlaybackMonitorView $PSScriptRoot)
+                    note = if ($saved.enabled) { '已保存，桌面应用会打开单网站监控窗口' } else { '已关闭内嵌网站监控' }
+                }
+            } catch {
+                Send-AfsJson -Stream $stream -Status 400 -Obj @{ ok = $false; error = $_.Exception.Message }
+            }
+            return
+        }
+        if (($path -eq '/api/playback/embedded' -or $path -eq '/api/playback/heartbeat') -and ($method -eq 'POST' -or $method -eq 'OPTIONS')) {
+            $corsHeaders = @(
+                'Access-Control-Allow-Origin: *',
+                'Access-Control-Allow-Methods: POST, OPTIONS',
+                'Access-Control-Allow-Headers: Content-Type',
+                'Access-Control-Allow-Private-Network: true'
+            )
+            if ($method -eq 'OPTIONS') {
+                Send-AfsResponse -Stream $stream -Status 204 -Type 'text/plain; charset=utf-8' -Body '' -ExtraHeaders $corsHeaders
+                return
+            }
+            try {
+                if ($contentLength -gt 65536) { throw '播放状态数据过大' }
+                $payload = ConvertTo-AfsHashtable (ConvertFrom-Json $body -ErrorAction Stop)
+                $clientId = [string]$payload.clientId
+                if ($clientId -notmatch '^em-[A-Za-z0-9_-]{8,64}$') { throw '只接受内嵌网站监控上报' }
+                $monitor = Get-AfsPlaybackMonitorConfig $PSScriptRoot
+                if (-not $monitor.enabled -or -not $monitor.host -or -not $monitor.token) {
+                    throw '内嵌网站监控未启用'
+                }
+                if ([string]$payload.token -ne [string]$monitor.token) { throw '内嵌监控令牌无效' }
+                $reports = @(ConvertTo-AfsPlaybackReports $payload.tabs)
+                foreach ($report in $reports) {
+                    if ([string]$report.host -ne [string]$monitor.host) { throw '只接受已配置网站的上报' }
+                }
+                $now = Get-Date
+                Save-AfsPlaybackHeartbeat -DataDir $PSScriptRoot -ClientId $clientId -Reports $reports -Now $now | Out-Null
+
+                # The monitor window owns its tab ids, so enforcement is returned
+                # in the heartbeat rather than guessed by the quota worker.
+                $closeTabs = @()
+                $masterEnabled = $true
+                try { $masterEnabled = [bool](Get-AfsConfig).enabled } catch { }
+                if ($masterEnabled) {
+                    $qcPath = Join-Path $PSScriptRoot 'game-quota-config.json'
+                    $qsPath = Join-Path $PSScriptRoot 'game-quota-state.json'
+                    if ((Test-Path $qcPath) -and (Test-Path $qsPath)) {
+                        try {
+                            $qc = ConvertTo-AfsAppQuotaConfig (Read-AfsJson $qcPath)
+                            $qs = Read-AfsAppQuotaState $qsPath $now
+                            $closeTabs = @(Get-AfsPlaybackCloseTabs -Reports $reports -Config $qc -State $qs -Now $now)
+                        } catch { }
+                    }
+                }
+                Send-AfsJson -Stream $stream -Status 200 -Obj @{
+                    ok = $true
+                    received = $reports.Count
+                    closeTabs = @($closeTabs)
+                    closeMonitor = [bool](@($closeTabs).Count -gt 0)
+                    retryMs = 3000
+                } -ExtraHeaders $corsHeaders
+            } catch {
+                Send-AfsJson -Stream $stream -Status 400 -Obj @{ ok = $false; error = $_.Exception.Message } -ExtraHeaders $corsHeaders
+            }
+            return
+        }
         if ($method -eq 'GET' -and $path -eq '/api/game-quota') {
             $qcPath = Join-Path $PSScriptRoot 'game-quota-config.json'
             $qsPath = Join-Path $PSScriptRoot 'game-quota-state.json'
@@ -405,7 +497,8 @@ $handler = {
                         [bool](@(Get-AfsQuotaTargetIds $rule) | Where-Object { $_ -in $qs.foregroundIds })
                 }
             }
-        Send-AfsJson -Stream $stream -Status 200 -Obj @{ok=$true; config=$qc; state=$qs; healthy=$healthy; masterEnabled=$masterEnabled; editWindow=$editWindow}
+            $playback = Get-AfsPlaybackView $PSScriptRoot $now
+        Send-AfsJson -Stream $stream -Status 200 -Obj @{ok=$true; config=$qc; state=$qs; healthy=$healthy; masterEnabled=$masterEnabled; editWindow=$editWindow; playback=$playback}
             return
         }
         if ($method -eq 'POST' -and $path -eq '/api/game-quota') {

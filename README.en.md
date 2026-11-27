@@ -43,6 +43,7 @@ The panel UI is Chinese-only.
 | **Browser window blocking** | Gracefully closes browser windows whose title matches (e.g. an "Entertainment" workspace), other windows untouched |
 | **Allow-list** | Domains and processes that are never blocked |
 | **Temp override** | "Block 30 min" / "Unblock 30 min", auto-reverts on expiry |
+| **Time limits** | Per-app/shared-cell daily minutes; foreground time by default |
 | **Stats** | Every override is logged (count + duration), plus ActivityWatch-style time-per-app tracking |
 | **Gist sync** | Push/pull the config to a private GitHub Gist; token is DPAPI-encrypted locally |
 | **Study desk** | Local goal tracker at `/study`: daily check-ins, board, weekly review, focus log — data never leaves the machine |

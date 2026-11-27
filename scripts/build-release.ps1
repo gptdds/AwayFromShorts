@@ -36,7 +36,10 @@ $runtimeFiles = @(
     'phone-activity.cache.json', 'study-gist.log', 'study-sync.log', 'hub-config.log',
     '.webui-restart.timestamp', 'game-quota-config.json', 'game-quota-state.json', 'game-quota-state.json.tmp',
     'quota-lan-config.json', 'quota-lan-state.json', 'quota-lan.log',
-    'quota-edit-until.json', 'quota-edit-until.json.tmp'
+    'quota-edit-until.json', 'quota-edit-until.json.tmp',
+    'playback-monitor.json', 'playback-monitor.json.tmp',
+    'playback-heartbeat.json', 'playback-heartbeat.json.tmp',
+    'playback-history.json', 'playback-history.json.tmp'
 )
 Get-ChildItem (Join-Path $stage 'src') -File |
     Where-Object { $runtimeFiles -contains $_.Name } |

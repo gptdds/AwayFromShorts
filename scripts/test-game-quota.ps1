@@ -306,6 +306,21 @@ $qSplit = ConvertTo-AfsAppQuotaConfig @{enabled=$true;rules=@(
 )}
 Assert ([bool](Test-AfsQuotaAppendOnly -Current $qBase -Incoming $qSplit)) 'Off-window: splitting the shared cell is rejected'
 Assert ($null -eq (Test-AfsQuotaAppendOnly -Current $qBase -Incoming $qBase)) 'Off-window: unchanged config is allowed'
+$qPlaybackOn = ConvertTo-AfsAppQuotaConfig @{enabled=$true;playback=@{enabled=$true};rules=@(
+    @{type='process';name='chrome';dailyMinutes=15}
+)}
+$qPlaybackOff = ConvertTo-AfsAppQuotaConfig @{enabled=$true;playback=@{enabled=$false};rules=@(
+    @{type='process';name='chrome';dailyMinutes=15}
+)}
+Assert ([bool](Test-AfsQuotaAppendOnly -Current $qPlaybackOn -Incoming $qPlaybackOff)) 'Off-window: turning background playback counting off is rejected'
+Assert ($null -eq (Test-AfsQuotaAppendOnly -Current $qPlaybackOff -Incoming $qPlaybackOn)) 'Off-window: turning background playback counting on is allowed'
+$rejectedPlayback = $false
+try {
+    ConvertTo-AfsAppQuotaConfig @{enabled=$true;playback=@{enabled='yes'};rules=@(
+        @{type='process';name='chrome';dailyMinutes=15}
+    )} | Out-Null
+} catch { $rejectedPlayback = $true }
+Assert $rejectedPlayback 'Background playback switch must be a boolean'
 # ---- 每条时间限额的生效星期 ----
 $legacyDays = ConvertTo-AfsAppQuotaConfig @{enabled=$true;rules=@(
     @{type='process';name='chrome';dailyMinutes=15}

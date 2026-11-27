@@ -42,3 +42,10 @@ browser-*.heartbeat
 game-quota-config.json
 game-quota-state.json*
 quota-edit-until.json*
+playback-heartbeat.json*
+playback-history.json*
+playback-monitor.json*
+
+# 本地运行态与临时输出
+$null
+.tmp

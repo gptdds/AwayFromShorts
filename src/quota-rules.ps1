@@ -70,15 +70,23 @@ function Test-AfsGameProcess {
 
 function ConvertTo-AfsAppQuotaConfig {
     param([hashtable]$Config)
+    $playbackInput = if ($Config.ContainsKey('playback')) { $Config.playback } else { $null }
     if (-not $Config.ContainsKey('rules')) {
         $old = ConvertTo-AfsQuotaConfig $Config
         $rules = @()
         if ($old.includeValorant) { $rules += @{type='valorant'; name='无畏契约'; dailyMinutes=$old.dailyMinutes; days=@(1..7)} }
         if ($old.includeSteam) { $rules += @{type='steam'; name='Steam（含 Steam 游戏）'; dailyMinutes=$old.dailyMinutes; days=@(1..7)} }
         foreach ($name in $old.processes) { $rules += @{type='process'; name=$name; dailyMinutes=$old.dailyMinutes; days=@(1..7)} }
-        $Config = @{enabled=$old.enabled; rules=$rules}
+        $Config = @{enabled=$old.enabled; rules=$rules; playback=$playbackInput}
     }
     if ($Config.enabled -isnot [bool]) { throw '启用状态格式不正确' }
+    if ($null -eq $playbackInput) { $playbackInput = @{enabled=$true} }
+    if ($playbackInput -isnot [hashtable]) { throw '后台播放限额格式不正确' }
+    $playbackEnabled = $true
+    if ($playbackInput.ContainsKey('enabled')) {
+        if ($playbackInput.enabled -isnot [bool]) { throw '后台播放限额开关必须为布尔值' }
+        $playbackEnabled = [bool]$playbackInput.enabled
+    }
     $rules = @(); $ids = @{}
     foreach ($r in @($Config.rules)) {
         if ($null -eq $r) { throw '应用规则不能为空' }
@@ -161,7 +169,11 @@ function ConvertTo-AfsAppQuotaConfig {
             $targetSeen[$targetId] = $true
         }
     }
-    return @{version=5; enabled=$Config.enabled; rules=$rules; mode='foreground'; reset='local-midnight'}
+    return @{
+        version=5; enabled=$Config.enabled; rules=$rules
+        playback=@{enabled=$playbackEnabled}
+        mode='foreground'; reset='local-midnight'
+    }
 }
 
 function Get-AfsQuotaEditWindow {
@@ -253,6 +265,12 @@ function Test-AfsQuotaAppendOnly {
             return ('规定时间以外新增应用只能用默认 120 分钟额度: ' + $newRules[$id].name + '。想设更长请等' + $WindowLabel + '。')
         }
     }
+    $curPlayback = $Current.playback
+    $newPlayback = $Incoming.playback
+    if ($null -ne $curPlayback -and $null -ne $newPlayback -and
+        [bool]$curPlayback.enabled -and -not [bool]$newPlayback.enabled) {
+        return ('规定时间以外不能关闭后台播放计入限额。想关请等' + $WindowLabel + '。')
+    }
     $null
 }
 
@@ -286,6 +304,362 @@ function Get-AfsQuotaWebsiteMatches {
                 break
             }
         }
+    }
+}
+
+# ---------- 网页后台播放 ----------
+# The embedded single-site WebView reports media state to the local WebUI.
+# Foreground browsing keeps using the existing UIA timer, so the two paths
+# do not double-count the same foreground page.
+
+$script:AFS_PLAYBACK_HEARTBEAT_FILE = 'playback-heartbeat.json'
+$script:AFS_PLAYBACK_HISTORY_FILE = 'playback-history.json'
+$script:AFS_PLAYBACK_MONITOR_FILE = 'playback-monitor.json'
+$script:AFS_PLAYBACK_ACTIVE_SECONDS = 15
+$script:AFS_PLAYBACK_CLIENT_SECONDS = 25
+$script:AFS_PLAYBACK_HISTORY_KEEP = 30
+
+function Get-AfsPlaybackHeartbeatPath {
+    param([string]$DataDir = $PSScriptRoot)
+    Join-Path $DataDir $script:AFS_PLAYBACK_HEARTBEAT_FILE
+}
+
+function Get-AfsPlaybackHistoryPath {
+    param([string]$DataDir = $PSScriptRoot)
+    Join-Path $DataDir $script:AFS_PLAYBACK_HISTORY_FILE
+}
+
+function Get-AfsPlaybackMonitorPath {
+    param([string]$DataDir = $PSScriptRoot)
+    Join-Path $DataDir $script:AFS_PLAYBACK_MONITOR_FILE
+}
+
+function ConvertTo-AfsPlaybackMonitorConfig {
+    param($Config)
+    $raw = ConvertTo-AfsHashtable $Config
+    if ($null -eq $raw -or $raw -isnot [hashtable]) { $raw = @{} }
+    $enabled = [bool]($raw.ContainsKey('enabled') -and $raw.enabled)
+    $url = ([string]$raw.url).Trim()
+    $hostName = ''
+    if ($url) { $hostName = ConvertTo-AfsQuotaWebsiteHost $url }
+    if ($enabled -and -not $hostName) { throw '请输入一个有效的 http(s) 网站地址' }
+    $token = ([string]$raw.token).Trim()
+    if ($token -and $token -notmatch '^[A-Za-z0-9_-]{16,64}$') { throw '内嵌监控令牌格式无效' }
+    $openAt = ([string]$raw.openAt).Trim()
+    if ($openAt) {
+        try { $null = [datetime]::Parse($openAt) } catch { $openAt = '' }
+    }
+    return @{
+        version = 1
+        enabled = $enabled
+        url = $url
+        host = $hostName
+        token = $token
+        openAt = $openAt
+        updatedAt = [string]$raw.updatedAt
+    }
+}
+
+function Get-AfsPlaybackMonitorConfig {
+    param([string]$DataDir = $PSScriptRoot)
+    $path = Get-AfsPlaybackMonitorPath $DataDir
+    if (-not (Test-Path -LiteralPath $path)) { return (ConvertTo-AfsPlaybackMonitorConfig @{}) }
+    try {
+        return (ConvertTo-AfsPlaybackMonitorConfig (Read-AfsJson $path))
+    } catch {
+        return (ConvertTo-AfsPlaybackMonitorConfig @{})
+    }
+}
+
+function Save-AfsPlaybackMonitorConfig {
+    param([string]$DataDir = $PSScriptRoot, $Config)
+    $next = ConvertTo-AfsPlaybackMonitorConfig $Config
+    if (-not $next.token) { $next.token = [Guid]::NewGuid().ToString('N') }
+    $next.updatedAt = (Get-Date).ToString('o')
+    Write-AfsJson (Get-AfsPlaybackMonitorPath $DataDir) $next
+    return $next
+}
+
+function Get-AfsPlaybackMonitorView {
+    param([string]$DataDir = $PSScriptRoot)
+    $config = Get-AfsPlaybackMonitorConfig $DataDir
+    return @{
+        enabled = [bool]$config.enabled
+        url = [string]$config.url
+        host = [string]$config.host
+        tokenSet = [bool]$config.token
+        openAt = [string]$config.openAt
+        updatedAt = [string]$config.updatedAt
+    }
+}
+
+function Get-AfsPlaybackAge {
+    param($Value, [datetime]$Now)
+    try {
+        $at = [datetime]::Parse([string]$Value)
+        return ($Now - $at).TotalSeconds
+    } catch {
+        return [double]::PositiveInfinity
+    }
+}
+
+function ConvertTo-AfsPlaybackReports {
+    param($Reports)
+    $out = @()
+    foreach ($report in @($Reports)) {
+        if ($null -eq $report) { continue }
+        $hostName = ConvertTo-AfsQuotaWebsiteHost ([string]$report.host)
+        if (-not $hostName) { continue }
+        $tabId = 0
+        [void][int]::TryParse([string]$report.tabId, [ref]$tabId)
+        $title = ([string]$report.title).Trim()
+        if ($title.Length -gt 160) { $title = $title.Substring(0, 160) }
+        $out += @{
+            tabId = $tabId
+            host = $hostName
+            title = $title
+            playing = [bool]$report.playing
+            background = [bool]$report.background
+        }
+        if ($out.Count -ge 32) { break }
+    }
+    return @($out)
+}
+
+function Read-AfsPlaybackHeartbeat {
+    param([string]$DataDir = $PSScriptRoot)
+    $empty = @{ version = 1; clients = @{}; updatedAt = '' }
+    $path = Get-AfsPlaybackHeartbeatPath $DataDir
+    if (-not (Test-Path -LiteralPath $path)) { return $empty }
+    try {
+        $raw = Read-AfsJson $path
+        if ($null -eq $raw -or $raw.clients -isnot [hashtable]) { return $empty }
+        $empty.updatedAt = [string]$raw.updatedAt
+        foreach ($id in @($raw.clients.Keys)) {
+            $client = $raw.clients[$id]
+            if ($null -eq $client -or $client -isnot [hashtable]) { continue }
+            $empty.clients[[string]$id] = @{
+                at = [string]$client.at
+                reports = @(ConvertTo-AfsPlaybackReports $client.reports)
+            }
+        }
+    } catch { }
+    return $empty
+}
+
+function Save-AfsPlaybackHeartbeat {
+    param(
+        [string]$DataDir = $PSScriptRoot,
+        [string]$ClientId,
+        $Reports,
+        [datetime]$Now = (Get-Date)
+    )
+    if ($ClientId -notmatch '^[A-Za-z0-9_-]{8,64}$') { throw '播放监控标识无效' }
+    $state = Read-AfsPlaybackHeartbeat $DataDir
+    $state.clients[$ClientId] = @{
+        at = $Now.ToString('o')
+        reports = @(ConvertTo-AfsPlaybackReports $Reports)
+    }
+    foreach ($id in @($state.clients.Keys)) {
+        $age = Get-AfsPlaybackAge $state.clients[$id].at $Now
+        if ($age -gt 90 -or $age -lt -10) { $state.clients.Remove($id) }
+    }
+    $state.version = 1
+    $state.updatedAt = $Now.ToString('o')
+    Write-AfsJson (Get-AfsPlaybackHeartbeatPath $DataDir) $state
+    return $state.clients[$ClientId]
+}
+
+function Get-AfsPlaybackSnapshot {
+    param([string]$DataDir = $PSScriptRoot, [datetime]$Now = (Get-Date))
+    $state = Read-AfsPlaybackHeartbeat $DataDir
+    $connected = $false
+    $latestAt = ''
+    $byHost = @{}
+    foreach ($id in @($state.clients.Keys)) {
+        $client = $state.clients[$id]
+        $age = Get-AfsPlaybackAge $client.at $Now
+        if ($age -lt -10 -or $age -gt $script:AFS_PLAYBACK_CLIENT_SECONDS) { continue }
+        $connected = $true
+        if (-not $latestAt -or (Get-AfsPlaybackAge $client.at $Now) -lt (Get-AfsPlaybackAge $latestAt $Now)) {
+            $latestAt = [string]$client.at
+        }
+        if ($age -gt $script:AFS_PLAYBACK_ACTIVE_SECONDS) { continue }
+        foreach ($report in @($client.reports)) {
+            if (-not $report.playing) { continue }
+            $hostName = [string]$report.host
+            if (-not $hostName) { continue }
+            if (-not $byHost.ContainsKey($hostName)) {
+                $byHost[$hostName] = @{
+                    host = $hostName
+                    title = [string]$report.title
+                    background = $false
+                    tabIds = @()
+                    at = [string]$latestAt
+                }
+            }
+            $item = $byHost[$hostName]
+            $item.background = [bool]($item.background -or $report.background)
+            if ([int]$report.tabId -gt 0 -and [int]$report.tabId -notin @($item.tabIds)) {
+                $item.tabIds = @($item.tabIds) + @([int]$report.tabId)
+            }
+            if (-not $item.title -and $report.title) { $item.title = [string]$report.title }
+        }
+    }
+    $active = @($byHost.Values | Sort-Object host)
+    return @{
+        connected = $connected
+        updatedAt = $state.updatedAt
+        activeAt = $latestAt
+        active = $active
+        activeHosts = @($active | ForEach-Object { $_.host })
+        backgroundHosts = @($active | Where-Object { $_.background } | ForEach-Object { $_.host })
+    }
+}
+
+function Get-AfsPlaybackRuleHostMap {
+    param($Snapshot, [object[]]$Rules)
+    $map = @{}
+    foreach ($report in @($Snapshot.active)) {
+        if (-not $report.background) { continue }
+        foreach ($rule in @(Get-AfsQuotaWebsiteMatches $report.host $Rules)) {
+            if (-not $map.ContainsKey([string]$rule)) { $map[[string]$rule] = [string]$report.host }
+        }
+    }
+    return $map
+}
+
+function Get-AfsPlaybackTargetIds {
+    param($Snapshot, [object[]]$Rules)
+    $ids = @()
+    foreach ($report in @($Snapshot.active)) {
+        if (-not $report.background) { continue }
+        foreach ($id in @(Get-AfsQuotaWebsiteMatches $report.host $Rules)) {
+            if ($id -notin $ids) { $ids += [string]$id }
+        }
+    }
+    return @($ids)
+}
+
+function Get-AfsPlaybackCloseTabs {
+    param($Reports, [hashtable]$Config, $State, [datetime]$Now = (Get-Date))
+    $closeTabs = @()
+    if ($null -eq $Config -or -not $Config.enabled -or $null -eq $State -or -not $State.apps) { return @() }
+    $exhausted = @($Config.rules | Where-Object {
+        (Test-AfsQuotaRuleActive $_ $Now) -and
+        $State.apps.ContainsKey([string]$_.id) -and
+        [bool]$State.apps[[string]$_.id].exhausted -and
+        ($_.type -eq 'website' -or @($_.websites | Where-Object { $_ }).Count)
+    })
+    $countBackground = [bool]($Config.playback -and $Config.playback.enabled)
+    foreach ($report in @($Reports)) {
+        if (-not $report.playing -or [int]$report.tabId -le 0) { continue }
+        if ($report.background -and -not $countBackground) { continue }
+        if (@(Get-AfsQuotaWebsiteMatches $report.host $exhausted).Count -and
+            [int]$report.tabId -notin $closeTabs) {
+            $closeTabs += [int]$report.tabId
+        }
+    }
+    return @($closeTabs)
+}
+
+function Read-AfsPlaybackHistory {
+    param([string]$DataDir = $PSScriptRoot, [datetime]$Now = (Get-Date))
+    $history = @{ version = 1; days = @{} }
+    $path = Get-AfsPlaybackHistoryPath $DataDir
+    if (-not (Test-Path -LiteralPath $path)) { return $history }
+    try {
+        $raw = Read-AfsJson $path
+        if ($null -eq $raw -or $raw.days -isnot [hashtable]) { return $history }
+        foreach ($date in @($raw.days.Keys)) {
+            if ([string]$date -notmatch '^\d{4}-\d{2}-\d{2}$') { continue }
+            $day = $raw.days[$date]
+            if ($null -eq $day -or $day -isnot [hashtable]) { continue }
+            $seconds = 0.0
+            if (-not [double]::TryParse([string]$day.seconds, [ref]$seconds) -or
+                [double]::IsNaN($seconds) -or [double]::IsInfinity($seconds) -or $seconds -lt 0) { continue }
+            $hosts = @{}
+            if ($day.hosts -is [hashtable]) {
+                foreach ($hostName in @($day.hosts.Keys)) {
+                    $hostSeconds = 0.0
+                    if (-not [double]::TryParse([string]$day.hosts[$hostName], [ref]$hostSeconds)) { continue }
+                    if ([double]::IsNaN($hostSeconds) -or [double]::IsInfinity($hostSeconds) -or $hostSeconds -le 0) { continue }
+                    $hosts[[string]$hostName] = [Math]::Min($hostSeconds, 86400.0)
+                }
+            }
+            $history.days[[string]$date] = @{ seconds = [Math]::Min($seconds, 86400.0); hosts = $hosts }
+        }
+    } catch { }
+    foreach ($date in @($history.days.Keys | Sort-Object -Descending | Select-Object -Skip $script:AFS_PLAYBACK_HISTORY_KEEP)) {
+        $history.days.Remove($date)
+    }
+    return $history
+}
+
+function Add-AfsPlaybackHistory {
+    param([hashtable]$History, [datetime]$Now, [double]$Seconds, [string]$HostName)
+    if ($null -eq $History -or $Seconds -le 0) { return $History }
+    $date = Get-AfsQuotaDayKey $Now
+    if (-not $History.ContainsKey('days') -or $History.days -isnot [hashtable]) {
+        $History.days = @{}
+    }
+    if (-not $History.days.ContainsKey($date)) {
+        $History.days[$date] = @{ seconds = 0.0; hosts = @{} }
+    }
+    $day = $History.days[$date]
+    if ($day.hosts -isnot [hashtable]) { $day.hosts = @{} }
+    $day.seconds = [double]$day.seconds + [Math]::Min($Seconds, 86400.0)
+    if ($HostName) {
+        $hostName = ConvertTo-AfsQuotaWebsiteHost $HostName
+        if ($hostName) {
+            $day.hosts[$hostName] = [double]$day.hosts[$hostName] + [Math]::Min($Seconds, 86400.0)
+        }
+    }
+    return $History
+}
+
+function Save-AfsPlaybackHistory {
+    param([string]$DataDir = $PSScriptRoot, [hashtable]$History)
+    if ($null -eq $History) { return }
+    $History.version = 1
+    Write-AfsJson (Get-AfsPlaybackHistoryPath $DataDir) $History
+}
+
+function Get-AfsPlaybackView {
+    param([string]$DataDir = $PSScriptRoot, [datetime]$Now = (Get-Date))
+    $snapshot = Get-AfsPlaybackSnapshot $DataDir $Now
+    $history = Read-AfsPlaybackHistory $DataDir $Now
+    $start = Get-AfsQuotaDayStart $Now
+    $days = @()
+    for ($offset = 6; $offset -ge 0; $offset--) {
+        $date = $start.AddDays(-$offset).ToString('yyyy-MM-dd')
+        $seconds = 0.0
+        if ($history.days.ContainsKey($date)) { $seconds = [double]$history.days[$date].seconds }
+        $days += @{ date = $date; seconds = [Math]::Round($seconds, 1) }
+    }
+    $today = $start.ToString('yyyy-MM-dd')
+    $todaySeconds = 0.0
+    $hosts = @()
+    if ($history.days.ContainsKey($today)) {
+        $todaySeconds = [double]$history.days[$today].seconds
+        $hosts = @($history.days[$today].hosts.Keys | ForEach-Object {
+            @{ host = [string]$_; seconds = [Math]::Round([double]$history.days[$today].hosts[$_], 1) }
+        } | Sort-Object { [double]$_.seconds } -Descending)
+    }
+    $last7Seconds = 0.0
+    foreach ($day in $days) { $last7Seconds += [double]$day.seconds }
+    return @{
+        connected = [bool]$snapshot.connected
+        updatedAt = [string]$snapshot.updatedAt
+        activeAt = [string]$snapshot.activeAt
+        active = @($snapshot.active)
+        activeHosts = @($snapshot.activeHosts)
+        backgroundHosts = @($snapshot.backgroundHosts)
+        todaySeconds = [Math]::Round($todaySeconds, 1)
+        last7Seconds = [Math]::Round($last7Seconds, 1)
+        days = @($days)
+        hosts = @($hosts)
+        monitor = Get-AfsPlaybackMonitorView $DataDir
     }
 }
 
@@ -326,12 +700,16 @@ function Get-AfsForegroundQuotaTarget {
 
 function Update-AfsAppQuotaState {
     param([hashtable]$State, [hashtable]$Config, [datetime]$Now, [double]$Elapsed=0, [string[]]$ForegroundIds=@(),
-          [double]$SharedUsedSeconds=0, [int]$PoolMinutes=0, [hashtable]$SharedPools=$null)
+          [double]$SharedUsedSeconds=0, [int]$PoolMinutes=0, [hashtable]$SharedPools=$null,
+          [string[]]$BackgroundPlaybackIds=@())
     $today=Get-AfsQuotaDayKey $Now
     if ($State.date -ne $today) {
-        $State=@{version=4;date=$today;targets=@{}}
+        $State=@{version=6;date=$today;targets=@{};playback=@{}}
         # 只把额度日重置之后的那一段算进新的一天（重置在早上 8 点，不是零点）
         $Elapsed=[Math]::Min($Elapsed,(Get-AfsQuotaDaySeconds $Now))
+    }
+    if (-not $State.ContainsKey('playback') -or $State.playback -isnot [hashtable]) {
+        $State.playback=@{}
     }
     if (-not $State.ContainsKey('targets')) {
         $State.targets=@{}
@@ -352,30 +730,41 @@ function Update-AfsAppQuotaState {
         }
     }
     if ($Config.enabled -and $Elapsed -gt 0 -and $Elapsed -le 5) {
-        foreach ($id in @($ForegroundIds | Select-Object -Unique)) {
-            $matching=@($activeRules | Where-Object { $id -in @(Get-AfsQuotaTargetIds $_) })
-            if (-not $matching.Count) { continue }
-            $add=$Elapsed
-            foreach ($r in $matching) {
-                $used=0.0
-                foreach ($target in @(Get-AfsQuotaTargetIds $r)) { $used += [double]$State.targets[$target] }
-                $phoneUsed=0.0
-                $limitMinutes=[int]$r.dailyMinutes
-                if ($r.ContainsKey('shared') -and [bool]$r.shared) {
-                    if ($null -ne $SharedPools -and $SharedPools.ContainsKey([string]$r.id)) {
-                        $pool=$SharedPools[[string]$r.id]
-                        $phoneUsed=[double]$pool.usedSeconds
-                        if ([int]$pool.minutes -gt 0) { $limitMinutes=[int]$pool.minutes }
-                    } else {
-                        $phoneUsed=[double]$SharedUsedSeconds
-                        if ($PoolMinutes -gt 0) { $limitMinutes=[int]$PoolMinutes }
-                    }
+        $foreground=@($ForegroundIds | Select-Object -Unique)
+        $playback=@()
+        if ($Config.playback -and $Config.playback.enabled) {
+            $playback=@($BackgroundPlaybackIds | Select-Object -Unique)
+        }
+        foreach ($r in $activeRules) {
+            $targets=@(Get-AfsQuotaTargetIds $r)
+            $foregroundTarget=@($foreground | Where-Object { $_ -in $targets })[0]
+            $playbackTarget=@($playback | Where-Object { $_ -in $targets })[0]
+            if (-not $foregroundTarget -and -not $playbackTarget) { continue }
+            $creditedTarget=if ($foregroundTarget) { $foregroundTarget } else { $playbackTarget }
+            $used=0.0
+            foreach ($target in $targets) { $used += [double]$State.targets[$target] }
+            $phoneUsed=0.0
+            $limitMinutes=[int]$r.dailyMinutes
+            if ($r.ContainsKey('shared') -and [bool]$r.shared) {
+                if ($null -ne $SharedPools -and $SharedPools.ContainsKey([string]$r.id)) {
+                    $pool=$SharedPools[[string]$r.id]
+                    $phoneUsed=[double]$pool.usedSeconds
+                    if ([int]$pool.minutes -gt 0) { $limitMinutes=[int]$pool.minutes }
+                } else {
+                    $phoneUsed=[double]$SharedUsedSeconds
+                    if ($PoolMinutes -gt 0) { $limitMinutes=[int]$PoolMinutes }
                 }
-                $room=[double]$limitMinutes*60-$used-$phoneUsed
-                # 共享池：本地能再记多少，取决于池子里还剩多少，不只是本地还剩多少。
-                $add=[Math]::Min($add,[Math]::Max(0.0,$room))
             }
-            $State.targets[$id]=[double]$State.targets[$id]+$add
+            $room=[double]$limitMinutes*60-$used-$phoneUsed
+            # 共享池：本地能再记多少，取决于池子里还剩多少，不只是本地还剩多少。
+            $add=[Math]::Min($Elapsed,[Math]::Max(0.0,$room))
+            if ($add -le 0) { continue }
+            $State.targets[$creditedTarget]=[double]$State.targets[$creditedTarget]+$add
+            if (-not $foregroundTarget) {
+                $previous=0.0
+                if ($State.playback.ContainsKey([string]$r.id)) { $previous=[double]$State.playback[[string]$r.id] }
+                $State.playback[[string]$r.id]=$previous+$add
+            }
         }
     }
     $State.apps=@{}
@@ -410,9 +799,10 @@ function Update-AfsAppQuotaState {
             shared=($r.ContainsKey('shared') -and [bool]$r.shared)
             activeToday=$activeToday
             days=@($r.days)
+            playbackSeconds=if ($State.playback.ContainsKey([string]$r.id)) { [double]$State.playback[[string]$r.id] } else { 0.0 }
         }
     }
-    $State.version=5; $State.updatedAt=$Now.ToString('o')
+    $State.version=6; $State.updatedAt=$Now.ToString('o')
     return $State
 }
 

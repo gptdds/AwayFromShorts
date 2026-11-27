@@ -1,5 +1,9 @@
 ﻿# Runs in the interactive desktop; independent of study/scheduled blocking.
-param([string]$DataDir = $PSScriptRoot, [switch]$LibraryOnly)
+param(
+    [string]$DataDir = $PSScriptRoot,
+    [switch]$LibraryOnly,
+    [string]$MutexName = 'Local\AwayFromShorts-GameQuota'
+)
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\core.ps1"
 . "$PSScriptRoot\quota-rules.ps1"
@@ -112,7 +116,7 @@ if (Test-Path -LiteralPath $lanScript) {
 
 $configFile = Join-Path $DataDir 'game-quota-config.json'
 $stateFile = Join-Path $DataDir 'game-quota-state.json'
-$mutex = New-Object Threading.Mutex($false, 'Local\AwayFromShorts-GameQuota')
+$mutex = New-Object Threading.Mutex($false, $MutexName)
 $owned = $false
 try {
     try { $owned = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned = $true }
@@ -129,6 +133,11 @@ try {
     # rule id -> @{ usedSeconds; minutes }. Each cross-device cell keeps its own
     # phone slice, so exhaustion of one pool must not drain another.
     $sharedPools = @{}
+    # Background playback history is kept in memory by this single writer and
+    # flushed periodically; per-tick writes would multiply disk IO for 1s data.
+    $playbackHistory = Read-AfsPlaybackHistory -DataDir $DataDir
+    $lastPlaybackHistoryWrite = -99.0
+    $playbackHistoryDirty = $false
     while ($true) {
         $tick = $watch.Elapsed.TotalSeconds
         $elapsed = $tick - $lastTick
@@ -146,13 +155,41 @@ try {
             $sharedPools = Get-AfsQuotaSharedUsage $DataDir $now $config.rules
         }
         if (-not $quotaEnabled) { $foregroundIds = @() }
-        $state = Update-AfsAppQuotaState $state $config $now $elapsed $foregroundIds 0 0 $sharedPools
+        $activeRules = @($config.rules | Where-Object { Test-AfsQuotaRuleActive $_ $now })
+        $playbackSnapshot = Get-AfsPlaybackSnapshot $DataDir $now
+        $playbackIds = @()
+        $playbackRuleHosts = @{}
+        if ($quotaEnabled -and [bool]$config.playback.enabled) {
+            $playbackIds = @(Get-AfsPlaybackTargetIds $playbackSnapshot $config.rules)
+            $playbackRuleHosts = Get-AfsPlaybackRuleHostMap $playbackSnapshot $config.rules
+        }
+        $stateDayBefore = [string]$state.date
+        $playbackBefore = @{}
+        if ($state.playback -is [hashtable]) {
+            foreach ($ruleId in @($state.playback.Keys)) { $playbackBefore[[string]$ruleId] = [double]$state.playback[$ruleId] }
+        }
+        $state = Update-AfsAppQuotaState $state $config $now $elapsed $foregroundIds 0 0 $sharedPools -BackgroundPlaybackIds $playbackIds
+        if ([string]$state.date -ne $stateDayBefore) { $playbackBefore = @{} }
+        foreach ($ruleId in @($state.playback.Keys)) {
+            $before = 0.0
+            if ($playbackBefore.ContainsKey([string]$ruleId)) { $before = [double]$playbackBefore[[string]$ruleId] }
+            $credited = [double]$state.playback[$ruleId] - $before
+            if ($credited -le 0) { continue }
+            $hostName = ''
+            if ($playbackRuleHosts.ContainsKey([string]$ruleId)) { $hostName = [string]$playbackRuleHosts[[string]$ruleId] }
+            Add-AfsPlaybackHistory -History $playbackHistory -Now $now -Seconds $credited -HostName $hostName | Out-Null
+            $playbackHistoryDirty = $true
+        }
+        if ($playbackHistoryDirty -and ($tick - $lastPlaybackHistoryWrite) -ge 20) {
+            Save-AfsPlaybackHistory $DataDir $playbackHistory
+            $lastPlaybackHistoryWrite = $tick
+            $playbackHistoryDirty = $false
+        }
         $hwnd = [AfsWin32.Native]::GetForegroundWindow()
         $foregroundId = [uint32]0
         if ($hwnd -ne [IntPtr]::Zero) { [void][AfsWin32.Native]::GetWindowThreadProcessId($hwnd, [ref]$foregroundId) }
         $foregroundIds = @()
         $failed = @()
-        $activeRules = @($config.rules | Where-Object { Test-AfsQuotaRuleActive $_ $now })
         $exhaustedRules = @($activeRules | Where-Object { $state.apps[$_.id].exhausted })
         $exhaustedApps = @($exhaustedRules | Where-Object { $_.type -in @('games','steam','valorant','process') -or $_.processes })
         if ($quotaEnabled -and $exhaustedApps.Count -gt 0) {

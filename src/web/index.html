@@ -1569,11 +1569,13 @@ const quotaSharedName = list => {
   return extra.length ? '无畏契约 + Steam + ' + extra.join(' + ') + '（共享）' : '无畏契约 + Steam（共享）';
 };
 function renderQuotaRules() {
-  const container = document.getElementById('quotaRules'); container.replaceChildren();
+  const container = document.getElementById('quotaRules');
+  container.replaceChildren();
   const sharedNames = quotaSharedCellNames(quotaRules);
   if (!quotaRules.length) container.textContent = '尚未添加应用或网址';
   quotaRules.forEach((rule, index) => {
     const row = document.createElement('div'); row.className = 'quota-rule' + (rule.shared ? ' is-shared' : '');
+    row.dataset.quotaRuleId = quotaRuleId(rule);
     const isNew = !savedQuotaIds.has(quotaRuleId(rule));
     const canChange = quotaAllowed || (isNew && ['process','website'].includes(rule.type));
     const label = document.createElement('label');
@@ -1863,7 +1865,8 @@ async function saveQuotaSettings(options = {}) {
   // 规定时间以外也允许提交：面板上的删除/改时长控件本来就禁用了，剩下的只有
   //「新增应用」「加进程」「设为跨设备」这类只加不减的改动，后端 Test-AfsQuotaAppendOnly
   // 会逐条把关（连关掉跨设备共享都算放行，一并拦下）。
-  const button=document.getElementById('quotaSave'), message=document.getElementById('quotaSaveStatus');
+  const button=document.getElementById('quotaSave');
+  const message=document.getElementById('quotaSaveStatus');
   const overviewButton = document.getElementById('overviewQuotaSave');
   const overviewStatus = document.getElementById('overviewQuotaStatus');
   overviewStatus.textContent = '';
@@ -1876,15 +1879,19 @@ async function saveQuotaSettings(options = {}) {
     const result=await api('/api/game-quota','POST',{version:5,enabled:document.getElementById('quotaEnabled').checked,
       // shared 显式传给后端：后端据此区分「用户主动关掉共享」和「旧页面没提这个字段」
       rules:quotaRules.map(r => ({...r, shared: !!r.shared}))});
-    quotaDirty=false; renderQuotaSettings(result.config,result.editWindow); message.textContent='已保存，约 1 秒生效';
-    if (!options.quiet) toast('时间限额已保存','ok');
+    quotaDirty=false;
+    renderQuotaSettings(result.config,result.editWindow);
+    message.textContent='已保存，约 1 秒生效';
+    if (!options.quiet) toast(options.toastText || '时间限额已保存','ok');
     await load();
     return true;
   } catch(error) {
     message.textContent=overviewStatus.textContent=error.message;
     return false;
   }
-  finally { button.disabled=overviewButton.disabled=false; }
+  finally {
+    button.disabled=overviewButton.disabled=false;
+  }
 }
 document.getElementById('quotaSettings').onsubmit=e => { e.preventDefault(); saveQuotaSettings(); };
 /* ================= 跨设备共享额度 ================= */
@@ -1947,7 +1954,7 @@ function renderQuotaUsage(q) {
   else if (!q.config.enabled) quotaStatus.textContent = '每日限额未开启';
   else if (!q.healthy || !q.state) quotaStatus.textContent = '计时器未运行，请检查后台任务';
   else if (q.state.error || (q.state.closeFailures || []).length) quotaStatus.textContent = '额度计时或关闭程序异常，请检查后台任务';
-  else quotaStatus.textContent = '计时器正常 · 电脑仅累计匹配的前台应用和网页';
+  else quotaStatus.textContent = '计时器正常 · 前台应用/网页';
   const usage = document.getElementById('quotaUsage');
   if (!usage) return;
   usage.replaceChildren();
@@ -1965,11 +1972,12 @@ function renderQuotaUsage(q) {
     const enabledToday = a?.activeToday;
     const box = document.createElement('div'); box.style.cssText = 'display:grid;gap:3px';
     const head = document.createElement('div');
-    const statusText = q.masterEnabled === false ? '已暂停（总开关关闭）' :
+    const baseStatus = q.masterEnabled === false ? '已暂停（总开关关闭）' :
       enabledToday === false ? '今天未启用，不累计、不冻结' :
       !q.healthy || qs?.error || !Number.isFinite(remaining) ? '剩余时间暂不可用' :
       '已用 ' + Math.floor(charged / 60) + ' / ' + limit + ' 分钟，剩余 ' +
       Math.ceil(remaining / 60) + ' 分钟' + (remaining === 0 ? '（已用尽）' : '');
+    const statusText = baseStatus;
     if (shared && sharedNames.has(quotaRuleId(rule))) {
       const tag = document.createElement('span');
       tag.className = 'quota-shared-tag';
@@ -2176,6 +2184,7 @@ async function load() {
   const [c, s] = coreR;
   const [a, st, act, stu, quota, lan] = extraR;
   if (quota.status === 'fulfilled') {
+    lastQuota = quota.value;
     renderQuotaSettings(quota.value.config, quota.value.editWindow);
   }
   // 跨设备状态先落下来：用量行要按池子的合计来显示
